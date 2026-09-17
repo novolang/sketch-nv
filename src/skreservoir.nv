@@ -1,0 +1,208 @@
+// skreservoir.nv — reservoir sampling, for keeping a fair sample.
+//
+// WHAT IT IS
+//
+// A reservoir of capacity `k` holds a uniform random sample of `k`
+// items from a stream of unknown length, in one pass, keeping nothing
+// else.  Vitter's algorithm R: the first `k` items go in; item `n`
+// after that replaces a random one with probability `k / n`.  Every
+// item seen has exactly the same chance of being in the sample at the
+// end, whether the stream had a thousand items or a billion.
+//
+// It is the one structure here that keeps the items themselves, which
+// is what it is for: a sketch answers a number, and a sample answers
+// "show me some".  A log pipeline keeping a hundred requests out of
+// ten million, a test harness keeping examples of a failure, a
+// profiler keeping stacks — all of them need the thing and not a count
+// of it.
+//
+// THE RANDOMNESS COMES FROM THE CALLER
+//
+// `offer` takes a uniform number in `0.0 ..< 1.0`.  This package
+// declares no effects and draws nothing: a caller that already has a
+// generator uses it, and a test hands in the numbers it wants and gets
+// a sample it can assert on.
+//
+// MERGING IS NOT FREE
+//
+// Two reservoirs merge into a uniform sample of both streams, but only
+// if the merge is weighted by how many items each stream saw — a
+// reservoir that saw a million items must dominate one that saw ten.
+// `merge` takes the uniforms it needs for that, and `seen_of` is the
+// count it weights by.
+
+use skfault
+
+// A reservoir sample.
+pub struct RsSketch
+    // How many items the reservoir holds at most.
+    capacity: Int
+    // How many items have been offered to it, which is what the
+    // replacement probability is computed from.
+    seen: Int
+    // The sample itself, in no meaningful order.
+    items: [Bytes]
+
+// An empty reservoir.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(100)
+//         Ok(r)  => println("${skreservoir.seen_of(r)}")    // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn new(capacity: Int) -> Result<RsSketch, skfault.SkFault>
+    todo("sketch-nv.skreservoir.new")
+
+// The reservoir after one item has been offered to it.
+//
+// `uniform` is a random number in `0.0 ..< 1.0`, used only once the
+// reservoir is full; before that the item is taken and the number
+// ignored.  `uniforms_needed` is the call that says so, for a caller
+// that would rather not draw one it will not use.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(2)
+//         Err(f) => println(f.message())
+//         Ok(r)  =>
+//             let one = skreservoir.offer(r, bytes.from_str("a"), 0.5)
+//             println("${skreservoir.seen_of(one)}")        // 1
+// ```
+pub fn offer(r: RsSketch, item: Bytes, uniform: Float) -> RsSketch
+    todo("sketch-nv.skreservoir.offer")
+
+// Whether the next `offer` will consume its uniform.
+//
+// False while the reservoir is still filling.  A caller drawing random
+// numbers from an expensive generator asks this first.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(2)
+//         Ok(r)  => println("${skreservoir.needs_uniform(r)}")   // false
+//         Err(f) => println(f.message())
+// ```
+pub fn needs_uniform(r: RsSketch) -> Bool
+    todo("sketch-nv.skreservoir.needs_uniform")
+
+// The sample: every item the reservoir currently holds.
+//
+// In no meaningful order — the order is where replacements happened to
+// land, and a caller that sorts it is asking a different question.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(100)
+//         Ok(r)  => println("${list.len(skreservoir.sample(r))}")    // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn sample(r: RsSketch) -> [Bytes]
+    todo("sketch-nv.skreservoir.sample")
+
+// How many items have been offered.
+//
+// The population the sample stands for, and the number every reported
+// proportion has to be scaled by: three errors in a sample of a
+// hundred drawn from a million offers is thirty thousand errors.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(100)
+//         Ok(r)  => println("${skreservoir.seen_of(r)}")    // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn seen_of(r: RsSketch) -> Int
+    todo("sketch-nv.skreservoir.seen_of")
+
+// Whether the reservoir holds as many items as it can.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(100)
+//         Ok(r)  => println("${skreservoir.is_full(r)}")    // false
+//         Err(f) => println(f.message())
+// ```
+pub fn is_full(r: RsSketch) -> Bool
+    todo("sketch-nv.skreservoir.is_full")
+
+// The chance that the next item offered will be kept.
+//
+// `1.0` until the reservoir is full, then `capacity / (seen + 1)`.
+// What a caller reports as its sampling rate, and the number a
+// downstream consumer needs to weight what it receives.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(100)
+//         Ok(r)  => println("${skreservoir.keep_probability(r)}")    // 1
+//         Err(f) => println(f.message())
+// ```
+pub fn keep_probability(r: RsSketch) -> Float
+    todo("sketch-nv.skreservoir.keep_probability")
+
+// A uniform sample of both streams.
+//
+// The merge is weighted by how many items each reservoir saw, so a
+// reservoir that saw a million dominates one that saw ten — an
+// unweighted merge would give the short stream half the sample and the
+// result would not be uniform over anything.
+//
+// `uniforms` supplies the randomness; one per item of the smaller
+// sample is enough, and a shorter list is refused rather than reused,
+// because reusing a number correlates the choices.  Refused when the
+// capacities differ.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(2)
+//         Err(f) => println(f.message())
+//         Ok(r)  =>
+//             match skreservoir.merge(r, r, [0.1, 0.2])
+//                 Ok(u)  => println("${skreservoir.seen_of(u)}")     // 0
+//                 Err(f) => println(f.message())
+// ```
+pub fn merge(a: RsSketch, b: RsSketch, uniforms: [Float]) -> Result<RsSketch, skfault.SkFault>
+    todo("sketch-nv.skreservoir.merge")
+
+// The reservoir as bytes, carrying its capacity and its seen count.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.new(100)
+//         Ok(r)  => println("${bytes.len(skreservoir.to_bytes(r)) > 0}")
+//         Err(f) => println(f.message())
+// ```
+pub fn to_bytes(r: RsSketch) -> Bytes
+    todo("sketch-nv.skreservoir.to_bytes")
+
+// A reservoir read back from bytes.
+//
+// ```novo
+// use skreservoir
+//
+// fn main() [io]
+//     match skreservoir.from_bytes(bytes.from_str(""))
+//         Ok(r)  => println("${skreservoir.seen_of(r)}")
+//         Err(f) => println(f.message())
+// ```
+pub fn from_bytes(b: Bytes) -> Result<RsSketch, skfault.SkFault>
+    todo("sketch-nv.skreservoir.from_bytes")

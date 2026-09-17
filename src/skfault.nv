@@ -1,0 +1,90 @@
+// skfault.nv — the ways a sketch can be refused.
+//
+// TWO MOMENTS
+//
+// A sketch is built with parameters that fix its accuracy — a
+// precision, a width and depth, a compression — and each of those has
+// a range outside which the published error bound does not hold.  That
+// is one moment, and it happens once.
+//
+// The other is a MERGE.  Two sketches can only be merged when they
+// were built the same way and fed through the same hash, and a merge
+// that ignored either would answer a number with no error bound at
+// all — silently, and in the direction of confidence.  Every merge
+// here answers a `Result`.
+
+// Why a sketch or a merge was refused.
+//
+// ```novo
+// use skfault
+//
+// fn main() [io]
+//     println(skfault.code(SkPrecisionOutOfRange(3)))
+// ```
+pub enum SkFault
+    // A HyperLogLog precision outside 4 ..= 18.  Below four the
+    // estimate is noise; above eighteen the register array is larger
+    // than the exact set would have been.
+    SkPrecisionOutOfRange(precision: Int)
+    // A count-min sketch's width or depth is not positive.
+    SkDimensionNotPositive(width: Int, depth: Int)
+    // A t-digest compression outside 20.0 ..= 1000.0.  Below twenty
+    // the digest has too few centroids to place a quantile; above a
+    // thousand it is a sorted copy of the data with extra steps.
+    SkCompressionOutOfRange(compression: Float)
+    // A reservoir capacity that is not positive.
+    SkCapacityNotPositive(capacity: Int)
+    // A quantile outside 0.0 ..= 1.0.
+    SkQuantileOutOfRange(quantile: Float)
+    // Two sketches were built with different parameters, so their
+    // registers do not line up and no merge of them means anything.
+    SkShapeMismatch(left: Str, right: Str)
+    // Two sketches were fed through different hashes.  The same item
+    // lands in different registers under different hashes, so the
+    // merged sketch would count it twice.  The identifiers are the
+    // labels the caller gave, which is the only way this package can
+    // tell two hashes apart.
+    SkHashMismatch(left: Str, right: Str)
+    // A serialised sketch could not be read: a header this package
+    // does not know, a length that disagrees with the parameters, a
+    // truncated body.
+    SkBadSerialisedForm(why: Str)
+
+// `SkFault` is an `Error`, which is what lets `Result<T, SkFault>`
+// exist at all.
+impl Error for SkFault
+    // The one-line message, naming what was given and what was
+    // required.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("sketch-nv.SkFault.message")
+
+// A short stable code for a log: `"precision_out_of_range"`,
+// `"hash_mismatch"`, and so on.
+//
+// ```novo
+// use skfault
+//
+// fn main() [io]
+//     println(skfault.code(SkHashMismatch("xxh3", "sha256")))
+// ```
+pub fn code(f: SkFault) -> Str
+    todo("sketch-nv.skfault.code")
+
+// Whether the fault is about combining two sketches rather than about
+// building one.
+//
+// True for `SkShapeMismatch` and `SkHashMismatch`.  A pipeline that
+// merges sketches from many machines wants to count these separately:
+// they mean two producers disagree about their configuration, which is
+// a deployment fault rather than a bad argument.
+//
+// ```novo
+// use skfault
+//
+// fn main() [io]
+//     println("${skfault.is_merge_fault(SkShapeMismatch("p14", "p12"))}")   // true
+// ```
+pub fn is_merge_fault(f: SkFault) -> Bool
+    todo("sketch-nv.skfault.is_merge_fault")

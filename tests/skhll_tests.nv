@@ -1,0 +1,152 @@
+// skhll_tests.nv — the API suite for the two hashed sketches.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// sketch-nv.skhll.<fn>` or `…skcms.<fn>`.  What is asserted is the
+// published error bound, that a merge of two sketches built
+// differently is refused rather than silently wrong, and that the
+// count-min sketch's error is one-sided.
+
+use std.test
+use skhll
+use skcms
+use skfault
+
+// A hash the suite can predict.  The real thing is the caller's
+// 64-bit hash; what matters here is that one function is used
+// throughout one sketch.
+fn fixed_hash(b: Bytes) -> Int
+    bytes.len(b) * 2654435761
+
+@test
+fn test_the_precision_fixes_the_memory_and_the_error_together() [io]
+    test.case("2^precision registers")
+    match skhll.new(12, "test")
+        Err(f) => test.fail("precision 12 is in range: ${f.message()}")
+        Ok(s)  =>
+            test.assert(skhll.register_count(s) == 4096)
+            test.assert(skhll.is_empty(s))
+            test.assert(skhll.estimate(s) == 0)
+
+            test.case("and the published relative standard error, 1.04 / sqrt(2^p)")
+            test.assert(skhll.relative_error(s) < 0.0163)
+            test.assert(skhll.relative_error(s) > 0.0162)
+
+    test.case("a precision below four is noise, and is refused")
+    match skhll.new(3, "test")
+        Ok(_)  => test.fail("precision 3 has no useful error bound")
+        Err(f) => test.assert(skfault.code(f) == "precision_out_of_range")
+
+    test.case("a precision above eighteen is larger than the exact set, and is refused")
+    match skhll.new(19, "test")
+        Ok(_)  => test.fail("precision 19 is bigger than counting exactly")
+        Err(f) => test.assert(skfault.is_merge_fault(f) == false)
+
+    test.case("a handful of items is counted exactly, which is what the bias correction is for")
+    match skhll.new(14, "test")
+        Err(f) => test.fail("precision 14 is in range: ${f.message()}")
+        Ok(s)  =>
+            let one = skhll.add(s, bytes.from_str("ada"), fixed_hash)
+            test.assert(skhll.estimate(one) == 1)
+            test.assert(skhll.is_empty(one) == false)
+
+            test.case("and the same item twice is still one distinct item")
+            test.assert(skhll.estimate(skhll.add(one, bytes.from_str("ada"), fixed_hash)) == 1)
+
+@test
+fn test_a_merge_across_different_shapes_is_refused_not_approximated() [io]
+    match skhll.new(12, "xxh3")
+        Err(f) => test.fail("precision 12 is in range: ${f.message()}")
+        Ok(a)  =>
+            test.case("two sketches of one shape merge into the sketch of both streams")
+            match skhll.merge(a, a)
+                Err(f) => test.fail("identical sketches merge: ${f.message()}")
+                Ok(u)  => test.assert(skhll.estimate(u) == 0)
+
+            test.case("a different precision does not line up, and is refused")
+            match skhll.new(14, "xxh3")
+                Err(f) => test.fail("precision 14 is in range: ${f.message()}")
+                Ok(b)  =>
+                    match skhll.merge(a, b)
+                        Ok(_)  => test.fail("registers of different sizes do not merge")
+                        Err(f) =>
+                            test.assert(skfault.code(f) == "shape_mismatch")
+                            test.assert(skfault.is_merge_fault(f))
+
+            test.case("and a different HASH is refused too — it would count items twice")
+            match skhll.new(12, "sha256")
+                Err(f) => test.fail("precision 12 is in range: ${f.message()}")
+                Ok(c)  =>
+                    match skhll.merge(a, c)
+                        Ok(_)  => test.fail("two hashes put one item in two registers")
+                        Err(f) => test.assert(skfault.code(f) == "hash_mismatch")
+
+    test.case("an already-hashed item is added without a second pass")
+    match skhll.new(12, "xxh3")
+        Ok(s)  => test.assert(skhll.estimate(skhll.add_hashed(s, 981723)) == 1)
+        Err(f) => test.fail("precision 12 is in range: ${f.message()}")
+
+@test
+fn test_the_count_min_error_is_one_sided_and_is_stated() [io]
+    test.case("a sketch is sized from the error a caller can reason about")
+    match skcms.with_error(0.001, 0.01, "test")
+        Err(f) => test.fail("epsilon 0.001, delta 0.01 is usable: ${f.message()}")
+        Ok(s)  =>
+            test.assert(s.width == 2000)
+            test.assert(s.depth == 7)
+            test.assert(skcms.error_bound(s) == 0.001)
+            test.assert(skcms.confidence(s) > 0.99)
+
+    test.case("an estimate is never BELOW the true count")
+    match skcms.new(256, 4, "test")
+        Err(f) => test.fail("256 by 4 is a table: ${f.message()}")
+        Ok(s)  =>
+            let one = skcms.add(s, bytes.from_str("/a"), 1, fixed_hash)
+            test.assert(skcms.estimate(one, bytes.from_str("/a"), fixed_hash) >= 1)
+            test.assert(one.total == 1)
+
+            test.case("an item never counted is estimated at zero or above, never below")
+            test.assert(skcms.estimate(one, bytes.from_str("/never"), fixed_hash) >= 0)
+
+            test.case("counts arrive in bulk as well as one at a time")
+            let bulk = skcms.add(one, bytes.from_str("/a"), 99, fixed_hash)
+            test.assert(bulk.total == 100)
+
+            test.case("halving is how it forgets, and the caller chooses when")
+            test.assert(skcms.halve(bulk).total == 50)
+
+    test.case("a table with no columns is refused")
+    match skcms.new(0, 4, "test")
+        Ok(_)  => test.fail("a sketch with no columns counts nothing")
+        Err(f) => test.assert(skfault.code(f) == "dimension_not_positive")
+
+@test
+fn test_both_sketches_serialise_with_the_facts_a_merge_checks() [io]
+    match skhll.new(12, "xxh3")
+        Err(f) => test.fail("precision 12 is in range: ${f.message()}")
+        Ok(s)  =>
+            test.case("a round trip is the same sketch")
+            match skhll.from_bytes(skhll.to_bytes(s))
+                Err(f) => test.fail("what `to_bytes` wrote reads back: ${f.message()}")
+                Ok(r)  =>
+                    test.assert(skhll.register_count(r) == 4096)
+                    match skhll.merge(s, r)
+                        Err(f) => test.fail("a round trip keeps the hash label: ${f.message()}")
+                        Ok(u)  => test.assert(skhll.estimate(u) == 0)
+
+    test.case("bytes that are not a sketch are refused, naming why")
+    match skhll.from_bytes(bytes.from_str("not a sketch"))
+        Ok(_)  => test.fail("this is not a serialised sketch")
+        Err(f) => test.assert(skfault.code(f) == "bad_serialised_form")
+
+    match skcms.new(256, 4, "xxh3")
+        Err(f) => test.fail("256 by 4 is a table: ${f.message()}")
+        Ok(s)  =>
+            test.case("the count-min sketch round-trips the same way")
+            match skcms.from_bytes(skcms.to_bytes(s))
+                Err(f) => test.fail("what `to_bytes` wrote reads back: ${f.message()}")
+                Ok(r)  =>
+                    test.assert(r.width == 256)
+                    test.assert(skcms.estimate_hashed(skcms.add_hashed(r, 7, 3), 7) >= 3)
+                    match skcms.merge(s, r)
+                        Err(f) => test.fail("a round trip keeps the shape: ${f.message()}")
+                        Ok(u)  => test.assert(u.total == 0)

@@ -1,0 +1,264 @@
+// sktdigest.nv — the t-digest, for quantiles.
+//
+// WHAT IT IS
+//
+// A t-digest answers "what is the 99th percentile" over a stream, in a
+// few kilobytes, with an error that is smallest exactly where it
+// matters: at the extremes.  It keeps a set of CENTROIDS, each a mean
+// and a weight, and it allows a centroid to be large in the middle of
+// the distribution and forces it to be small at the ends.  Ted Dunning
+// and Otmar Ertl's paper is the reference.
+//
+// The consequence is the property no fixed-bucket histogram has: the
+// 99.9th percentile is accurate to a few parts in a thousand without
+// anyone having chosen a bucket boundary in advance.  A Prometheus
+// histogram needs its buckets decided before the first observation,
+// and a bucket chosen wrongly cannot be fixed without losing the
+// history.
+//
+// COMPRESSION IS THE ONE KNOB
+//
+// It bounds the number of centroids, and with it both the memory and
+// the error.  100 is the usual choice: a few kilobytes, and about
+// 1% relative error at the median falling to about 0.1% at the 99th
+// percentile.
+//
+// MERGEABLE, AND THAT IS WHY IT IS HERE
+//
+// Two digests merge into the digest of both streams.  Quantiles
+// computed per machine cannot be averaged — the mean of two 99th
+// percentiles is not the 99th percentile of anything — so a service
+// that reports quantiles per instance either merges digests or reports
+// numbers nobody can aggregate.
+
+use skfault
+
+// One centroid: a mean and how many observations it stands for.
+pub struct TdCentroid
+    // The mean of the observations this centroid holds.
+    mean: Float
+    // How many observations that is.
+    weight: Int
+
+// A t-digest.
+pub struct TdSketch
+    // The compression: the knob that bounds the centroid count.
+    compression: Float
+    // The centroids, in ascending order of mean.
+    centroids: [TdCentroid]
+    // How many observations the digest has taken.
+    count: Int
+    // The smallest observation, or `0.0` when there are none.  Kept
+    // exactly, because the 0th percentile should be the minimum and
+    // not an approximation of it.
+    minimum: Float
+    // The largest observation, kept exactly for the same reason.
+    maximum: Float
+
+// An empty digest.
+//
+// `compression` must be in `20.0 ..= 1000.0`.  A hundred is the usual
+// choice.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.count_of(d)}")     // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn new(compression: Float) -> Result<TdSketch, skfault.SkFault>
+    todo("sketch-nv.sktdigest.new")
+
+// The digest with one observation added.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.count_of(sktdigest.add(d, 0.42))}")    // 1
+//         Err(f) => println(f.message())
+// ```
+pub fn add(d: TdSketch, value: Float) -> TdSketch
+    todo("sketch-nv.sktdigest.add")
+
+// The digest with one observation added `weight` times.
+//
+// For a caller that has already counted duplicates — a histogram being
+// converted, a run-length-encoded stream.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.count_of(sktdigest.add_weighted(d, 0.42, 7))}")
+//         Err(f) => println(f.message())
+// ```
+pub fn add_weighted(d: TdSketch, value: Float, weight: Int) -> TdSketch
+    todo("sketch-nv.sktdigest.add_weighted")
+
+// The value at a quantile.
+//
+// `quantile` is in `0.0 ..= 1.0`; `0.5` is the median and `0.99` the
+// 99th percentile.  `0.0` answers the exact minimum and `1.0` the
+// exact maximum, because those two are kept exactly.
+//
+// Refused for a quantile outside the range, rather than clamped: a
+// caller that asked for the 99th percentile as `99.0` has a bug, and
+// clamping would answer the maximum and hide it.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Err(f) => println(f.message())
+//         Ok(d)  =>
+//             match sktdigest.quantile(sktdigest.add(d, 0.42), 0.5)
+//                 Ok(v)  => println("${v}")             // 0.42
+//                 Err(f) => println(f.message())
+// ```
+pub fn quantile(d: TdSketch, quantile: Float) -> Result<Float, skfault.SkFault>
+    todo("sketch-nv.sktdigest.quantile")
+
+// Where a value falls in the distribution, as a fraction in
+// `0.0 ..= 1.0`.
+//
+// The inverse of `quantile`, and the question behind "is this request
+// unusually slow": a value at rank 0.999 is slower than 99.9% of what
+// the digest has seen.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.rank(sktdigest.add(d, 0.42), 0.42)}")
+//         Err(f) => println(f.message())
+// ```
+pub fn rank(d: TdSketch, value: Float) -> Float
+    todo("sketch-nv.sktdigest.rank")
+
+// Several quantiles at once.
+//
+// One pass over the centroids instead of one per quantile, which is
+// what a metrics export does: a service reporting the 50th, 90th, 99th
+// and 99.9th asks four questions of one digest.  Refused if any
+// quantile is out of range.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Err(f) => println(f.message())
+//         Ok(d)  =>
+//             match sktdigest.quantiles(sktdigest.add(d, 0.42), [0.5, 0.9])
+//                 Ok(vs) => println("${list.len(vs)}")  // 2
+//                 Err(f) => println(f.message())
+// ```
+pub fn quantiles(d: TdSketch, qs: [Float]) -> Result<[Float], skfault.SkFault>
+    todo("sketch-nv.sktdigest.quantiles")
+
+// The digest of both streams.
+//
+// Refused when the compressions differ: two digests with different
+// centroid bounds do not merge into one with a stated error.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Err(f) => println(f.message())
+//         Ok(d)  =>
+//             match sktdigest.merge(d, d)
+//                 Ok(u)  => println("${sktdigest.count_of(u)}")     // 0
+//                 Err(f) => println(f.message())
+// ```
+pub fn merge(a: TdSketch, b: TdSketch) -> Result<TdSketch, skfault.SkFault>
+    todo("sketch-nv.sktdigest.merge")
+
+// How many observations the digest has taken.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.count_of(d)}")     // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn count_of(d: TdSketch) -> Int
+    todo("sketch-nv.sktdigest.count_of")
+
+// The smallest observation, kept exactly.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.minimum_of(sktdigest.add(d, 0.42))}")   // 0.42
+//         Err(f) => println(f.message())
+// ```
+pub fn minimum_of(d: TdSketch) -> Float
+    todo("sketch-nv.sktdigest.minimum_of")
+
+// The largest observation, kept exactly.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.maximum_of(sktdigest.add(d, 0.42))}")   // 0.42
+//         Err(f) => println(f.message())
+// ```
+pub fn maximum_of(d: TdSketch) -> Float
+    todo("sketch-nv.sktdigest.maximum_of")
+
+// How many centroids the digest currently holds.
+//
+// Bounded by the compression, and the number that says how much memory
+// the digest is using.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${sktdigest.centroid_count(d)}")   // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn centroid_count(d: TdSketch) -> Int
+    todo("sketch-nv.sktdigest.centroid_count")
+
+// The digest as bytes, carrying its compression.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.new(100.0)
+//         Ok(d)  => println("${bytes.len(sktdigest.to_bytes(d)) > 0}")
+//         Err(f) => println(f.message())
+// ```
+pub fn to_bytes(d: TdSketch) -> Bytes
+    todo("sketch-nv.sktdigest.to_bytes")
+
+// A digest read back from bytes.
+//
+// ```novo
+// use sktdigest
+//
+// fn main() [io]
+//     match sktdigest.from_bytes(bytes.from_str(""))
+//         Ok(d)  => println("${sktdigest.count_of(d)}")
+//         Err(f) => println(f.message())
+// ```
+pub fn from_bytes(b: Bytes) -> Result<TdSketch, skfault.SkFault>
+    todo("sketch-nv.sktdigest.from_bytes")

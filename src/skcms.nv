@@ -1,0 +1,241 @@
+// skcms.nv — the count-min sketch, for counting how often.
+//
+// WHAT IT IS
+//
+// A count-min sketch counts occurrences of items in memory that does
+// not grow with the number of distinct items.  It is a table of `depth`
+// rows and `width` columns: each item is hashed once per row, and the
+// counter at that column is incremented.  An estimate is the SMALLEST
+// of the `depth` counters the item lands on — which is where the name
+// comes from, and why the estimate can only be too high.
+//
+// ONE-SIDED ERROR IS THE WHOLE POINT
+//
+// The estimate is never below the true count, and it is above by more
+// than `epsilon x total` with probability at most `delta`.  A caller
+// can therefore act on a high estimate cautiously and on a low one
+// with confidence, which is exactly what a heavy-hitter detector, a
+// per-key rate limiter and a cache admission policy all need.  A
+// structure with two-sided error would give none of them anything.
+//
+// THE SKETCH DOES NOT REMEMBER ITEMS
+//
+// It cannot list what it has counted, only answer about an item the
+// caller names.  That is what makes it small, and it is why finding
+// the top items needs a heap of candidates the caller keeps beside it.
+//
+// The hash and the hash label work exactly as in `skhll`.
+
+use skfault
+
+// A count-min sketch.
+pub struct CmsSketch
+    // Columns per row.  Sets the error: `epsilon` is about
+    // `2 / width`.
+    width: Int
+    // Rows.  Sets the confidence: `delta` is about `0.5^depth`.
+    depth: Int
+    // The label the caller gave for the hash the sketch was fed
+    // through.
+    hash_id: Str
+    // The counters, `depth * width` of them, row-major.
+    counts: [Int]
+    // Every increment the sketch has taken, which is what the error
+    // bound is relative to.
+    total: Int
+
+// An empty sketch with an explicit table size.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(2048, 5, "xxh3")
+//         Ok(s)  => println("${s.width}")               // 2048
+//         Err(f) => println(f.message())
+// ```
+pub fn new(width: Int, depth: Int, hash_id: Str) -> Result<CmsSketch, skfault.SkFault>
+    todo("sketch-nv.skcms.new")
+
+// An empty sketch sized from the error bound the caller wants.
+//
+// `epsilon` is how far above the truth an estimate may be, as a
+// fraction of the total counted; `delta` is the probability that it is
+// further.  The table is `ceil(2 / epsilon)` columns by
+// `ceil(ln(1 / delta) / ln 2)` rows, which is the sizing of Cormode
+// and Muthukrishnan's original paper.
+//
+// This is the constructor to prefer: the numbers a caller can reason
+// about are the error and the confidence, not the width and the depth.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.with_error(0.001, 0.01, "xxh3")
+//         Ok(s)  => println("${s.depth}")               // 7
+//         Err(f) => println(f.message())
+// ```
+pub fn with_error(epsilon: Float, delta: Float, hash_id: Str) -> Result<CmsSketch, skfault.SkFault>
+    todo("sketch-nv.skcms.with_error")
+
+// The sketch with `count` more of an item.
+//
+// `count` may be any positive number, so a caller counting bytes or
+// costs adds them in one call rather than one at a time.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(256, 4, "test")
+//         Err(f) => println(f.message())
+//         Ok(s)  =>
+//             let once = skcms.add(s, bytes.from_str("/a"), 1, fake_hash)
+//             println("${once.total}")                  // 1
+//
+// fn fake_hash(b: Bytes) -> Int
+//     11
+// ```
+pub fn add(s: CmsSketch, item: Bytes, count: Int, hash: fn(Bytes) -> Int) -> CmsSketch
+    todo("sketch-nv.skcms.add")
+
+// The sketch with `count` more of an already-hashed item.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(256, 4, "xxh3")
+//         Ok(s)  => println("${skcms.add_hashed(s, 981723, 1).total}")   // 1
+//         Err(f) => println(f.message())
+// ```
+pub fn add_hashed(s: CmsSketch, hashed: Int, count: Int) -> CmsSketch
+    todo("sketch-nv.skcms.add_hashed")
+
+// How often the sketch estimates it has seen an item.
+//
+// Never below the true count.  Above it by more than
+// `error_bound(s) * total` with probability at most `1 - confidence(s)`.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(256, 4, "test")
+//         Err(f) => println(f.message())
+//         Ok(s)  => println("${skcms.estimate(s, bytes.from_str("/a"), fake_hash)}")
+//
+// fn fake_hash(b: Bytes) -> Int
+//     11
+// ```
+pub fn estimate(s: CmsSketch, item: Bytes, hash: fn(Bytes) -> Int) -> Int
+    todo("sketch-nv.skcms.estimate")
+
+// How often the sketch estimates it has seen an already-hashed item.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(256, 4, "xxh3")
+//         Ok(s)  => println("${skcms.estimate_hashed(s, 981723)}")       // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn estimate_hashed(s: CmsSketch, hashed: Int) -> Int
+    todo("sketch-nv.skcms.estimate_hashed")
+
+// How far above the true count an estimate may be, as a fraction of
+// the total counted.
+//
+// `2 / width`, the `epsilon` of the sizing.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(2000, 5, "xxh3")
+//         Ok(s)  => println("${skcms.error_bound(s) == 0.001}")          // true
+//         Err(f) => println(f.message())
+// ```
+pub fn error_bound(s: CmsSketch) -> Float
+    todo("sketch-nv.skcms.error_bound")
+
+// The probability that an estimate is within the error bound.
+//
+// `1 - 0.5^depth`.  Five rows give about 0.969, ten give about 0.999.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(2000, 5, "xxh3")
+//         Ok(s)  => println("${skcms.confidence(s) > 0.96}")             // true
+//         Err(f) => println(f.message())
+// ```
+pub fn confidence(s: CmsSketch) -> Float
+    todo("sketch-nv.skcms.confidence")
+
+// The sketch that has counted everything both have.
+//
+// Two sketches of the same shape add counter by counter, and the
+// result is exactly the sketch that would have counted both streams.
+// Refused when the shapes or the hash labels differ.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(256, 4, "xxh3")
+//         Err(f) => println(f.message())
+//         Ok(s)  =>
+//             match skcms.merge(s, s)
+//                 Ok(u)  => println("${u.total}")       // 0
+//                 Err(f) => println(f.message())
+// ```
+pub fn merge(a: CmsSketch, b: CmsSketch) -> Result<CmsSketch, skfault.SkFault>
+    todo("sketch-nv.skcms.merge")
+
+// The sketch with every counter halved, rounding down.
+//
+// How a count-min sketch forgets: a stream that runs for a week
+// otherwise answers about the whole week, and a caller that wants
+// "recently" halves on a schedule it chooses.  This package reads no
+// clock, so it cannot choose one.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(256, 4, "xxh3")
+//         Ok(s)  => println("${skcms.halve(s).total}")  // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn halve(s: CmsSketch) -> CmsSketch
+    todo("sketch-nv.skcms.halve")
+
+// The sketch as bytes, carrying its shape and hash label.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.new(256, 4, "xxh3")
+//         Ok(s)  => println("${bytes.len(skcms.to_bytes(s)) > 0}")
+//         Err(f) => println(f.message())
+// ```
+pub fn to_bytes(s: CmsSketch) -> Bytes
+    todo("sketch-nv.skcms.to_bytes")
+
+// A sketch read back from bytes.
+//
+// ```novo
+// use skcms
+//
+// fn main() [io]
+//     match skcms.from_bytes(bytes.from_str(""))
+//         Ok(s)  => println("${s.total}")
+//         Err(f) => println(f.message())
+// ```
+pub fn from_bytes(b: Bytes) -> Result<CmsSketch, skfault.SkFault>
+    todo("sketch-nv.skcms.from_bytes")

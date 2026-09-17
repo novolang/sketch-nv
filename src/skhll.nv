@@ -1,0 +1,224 @@
+// skhll.nv — HyperLogLog++, for counting distinct things.
+//
+// WHAT IT IS
+//
+// Counting distinct items exactly costs memory proportional to the
+// number of distinct items.  HyperLogLog counts them approximately in
+// a fixed amount of memory — a few kilobytes for a billion items —
+// with a relative error that depends only on the size of that memory.
+// HyperLogLog++ is Google's 2013 refinement: a 64-bit hash, a bias
+// correction for small cardinalities, and a sparse representation.
+//
+// The idea is that the position of the leftmost one-bit in a random
+// hash is a witness to how many distinct values have been seen: one in
+// two hashes begins with a one, one in four with a zero-one, and so
+// on.  The sketch keeps the largest such position per register and
+// averages harmonically across registers.
+//
+// THE HASH IS THE CALLER'S, AND THE SKETCH REMEMBERS WHICH
+//
+// Every operation that reads an item takes the hash as a parameter, so
+// this package chooses no hash function for anyone: a caller that
+// already hashes its keys for sharding uses the same hash here and
+// pays for one pass instead of two.
+//
+// The sketch does NOT carry the function — that would make it
+// unserialisable and untestable — but it does carry a LABEL the caller
+// gave, and a merge of two sketches with different labels is refused.
+// Two hashes put the same item in different registers, so merging
+// their sketches counts it twice.
+//
+// THE ERROR BOUND IS PUBLISHED, AND IT IS A TEST
+//
+// The relative standard error is `1.04 / sqrt(2^precision)`: 1.6% at
+// precision 12, 0.8% at 14.  `relative_error` answers it, and the
+// suite asserts the estimate stays within it.
+
+use skfault
+
+// A HyperLogLog++ sketch.
+pub struct HllSketch
+    // The precision: how many leading bits of the hash choose the
+    // register.  `2^precision` registers, 4 ..= 18.
+    precision: Int
+    // The label the caller gave for the hash the sketch was fed
+    // through.  Compared on a merge; never interpreted.
+    hash_id: Str
+    // One register per bucket, each holding the largest leading-zero
+    // count seen for it.
+    registers: [Int]
+
+// An empty sketch.
+//
+// `precision` fixes the memory and the error together: `2^precision`
+// registers, and a relative standard error of
+// `1.04 / sqrt(2^precision)`.  Twelve is the usual choice — 4096
+// registers, about 1.6% error.
+//
+// `hash_id` names the hash the caller will feed it with, such as
+// `"xxh3"`.  It is compared on a merge and interpreted nowhere.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Ok(s)  => println("${skhll.register_count(s)}")   // 4096
+//         Err(f) => println(f.message())
+// ```
+pub fn new(precision: Int, hash_id: Str) -> Result<HllSketch, skfault.SkFault>
+    todo("sketch-nv.skhll.new")
+
+// The sketch with one item added.
+//
+// `hash` is the caller's 64-bit hash.  The same function must be used
+// for every item of one sketch: a sketch fed through two hashes counts
+// some items twice.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "test")
+//         Err(f) => println(f.message())
+//         Ok(s)  =>
+//             let with_one = skhll.add(s, bytes.from_str("ada"), fake_hash)
+//             println("${skhll.estimate(with_one)}")
+//
+// fn fake_hash(b: Bytes) -> Int
+//     7
+// ```
+pub fn add(s: HllSketch, item: Bytes, hash: fn(Bytes) -> Int) -> HllSketch
+    todo("sketch-nv.skhll.add")
+
+// The sketch with one already-hashed item added.
+//
+// For a caller that hashed the item for another reason — a shard key,
+// a cache lookup — and should not pay for a second pass.  The value
+// must come from the same hash the sketch's `hash_id` names.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Ok(s)  => println("${skhll.estimate(skhll.add_hashed(s, 981723))}")
+//         Err(f) => println(f.message())
+// ```
+pub fn add_hashed(s: HllSketch, hashed: Int) -> HllSketch
+    todo("sketch-nv.skhll.add_hashed")
+
+// How many distinct items the sketch estimates it has seen.
+//
+// Approximate, within the relative error the precision fixes.  An
+// empty sketch answers `0` exactly, and a sketch that has seen a
+// handful of items answers exactly, because HyperLogLog++'s bias
+// correction is exact in that range.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Ok(s)  => println("${skhll.estimate(s)}")         // 0
+//         Err(f) => println(f.message())
+// ```
+pub fn estimate(s: HllSketch) -> Int
+    todo("sketch-nv.skhll.estimate")
+
+// The relative standard error the sketch's precision gives:
+// `1.04 / sqrt(2^precision)`.
+//
+// Published so a caller can report its own accuracy — "about 4.1
+// million, within 1.6%" is a useful sentence and "about 4.1 million"
+// is not.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Ok(s)  => println("${skhll.relative_error(s) < 0.017}")   // true
+//         Err(f) => println(f.message())
+// ```
+pub fn relative_error(s: HllSketch) -> Float
+    todo("sketch-nv.skhll.relative_error")
+
+// The sketch that has seen everything both have.
+//
+// The operation the whole shape exists for: a hundred machines each
+// keep a sketch, and the union of a hundred sketches is as accurate as
+// one sketch of everything.  An exact distinct count cannot be
+// combined that way.
+//
+// Refused when the precisions differ or the hash labels differ.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Err(f) => println(f.message())
+//         Ok(s)  =>
+//             match skhll.merge(s, s)
+//                 Ok(u)  => println("${skhll.estimate(u)}")     // 0
+//                 Err(f) => println(f.message())
+// ```
+pub fn merge(a: HllSketch, b: HllSketch) -> Result<HllSketch, skfault.SkFault>
+    todo("sketch-nv.skhll.merge")
+
+// Whether the sketch has seen nothing.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Ok(s)  => println("${skhll.is_empty(s)}")         // true
+//         Err(f) => println(f.message())
+// ```
+pub fn is_empty(s: HllSketch) -> Bool
+    todo("sketch-nv.skhll.is_empty")
+
+// How many registers the sketch has: `2^precision`.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Ok(s)  => println("${skhll.register_count(s)}")   // 4096
+//         Err(f) => println(f.message())
+// ```
+pub fn register_count(s: HllSketch) -> Int
+    todo("sketch-nv.skhll.register_count")
+
+// The sketch as bytes, for a store or a wire.
+//
+// The form carries the precision and the hash label beside the
+// registers, so a sketch read back can be checked against the one it
+// is merged into rather than corrupting it.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.new(12, "xxh3")
+//         Ok(s)  => println("${bytes.len(skhll.to_bytes(s)) > 0}")
+//         Err(f) => println(f.message())
+// ```
+pub fn to_bytes(s: HllSketch) -> Bytes
+    todo("sketch-nv.skhll.to_bytes")
+
+// A sketch read back from bytes.
+//
+// ```novo
+// use skhll
+//
+// fn main() [io]
+//     match skhll.from_bytes(bytes.from_str(""))
+//         Ok(s)  => println("${skhll.estimate(s)}")
+//         Err(f) => println(f.message())
+// ```
+pub fn from_bytes(b: Bytes) -> Result<HllSketch, skfault.SkFault>
+    todo("sketch-nv.skhll.from_bytes")

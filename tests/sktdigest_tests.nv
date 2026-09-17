@@ -1,0 +1,150 @@
+// sktdigest_tests.nv — the API suite for the t-digest and the
+// reservoir.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// sketch-nv.sktdigest.<fn>` or `…skreservoir.<fn>`.  What is asserted
+// is that the extremes are exact, that a quantile outside the range is
+// refused rather than clamped, and that the reservoir's randomness
+// comes from the caller.
+
+use std.test
+use sktdigest
+use skreservoir
+use skfault
+
+@test
+fn test_the_extremes_are_exact_and_the_middle_is_approximate() [io]
+    match sktdigest.new(100.0)
+        Err(f) => test.fail("compression 100 is in range: ${f.message()}")
+        Ok(d0) =>
+            let d = sktdigest.add(sktdigest.add(sktdigest.add(d0, 1.0), 2.0), 3.0)
+
+            test.case("three observations")
+            test.assert(sktdigest.count_of(d) == 3)
+
+            test.case("the minimum and the maximum are kept exactly, not approximated")
+            test.assert(sktdigest.minimum_of(d) == 1.0)
+            test.assert(sktdigest.maximum_of(d) == 3.0)
+
+            test.case("so the 0th and 100th percentiles are those two numbers")
+            match sktdigest.quantile(d, 0.0)
+                Err(f) => test.fail("0.0 is a quantile: ${f.message()}")
+                Ok(v)  => test.assert(v == 1.0)
+            match sktdigest.quantile(d, 1.0)
+                Err(f) => test.fail("1.0 is a quantile: ${f.message()}")
+                Ok(v)  => test.assert(v == 3.0)
+
+            test.case("the median is in range")
+            match sktdigest.quantile(d, 0.5)
+                Err(f) => test.fail("0.5 is a quantile: ${f.message()}")
+                Ok(v)  => test.assert(v >= 1.0)
+
+            test.case("several quantiles come from one pass")
+            match sktdigest.quantiles(d, [0.5, 0.9, 0.99])
+                Err(f) => test.fail("all three are quantiles: ${f.message()}")
+                Ok(vs) => test.assert(list.len(vs) == 3)
+
+            test.case("and the rank is the inverse question")
+            test.assert(sktdigest.rank(d, 1.0) <= 0.5)
+
+@test
+fn test_a_quantile_outside_the_range_is_refused_rather_than_clamped() [io]
+    match sktdigest.new(100.0)
+        Err(f) => test.fail("compression 100 is in range: ${f.message()}")
+        Ok(d)  =>
+            test.case("`99.0` is a caller that meant 0.99, and clamping would hide it")
+            match sktdigest.quantile(d, 99.0)
+                Ok(_)  => test.fail("a quantile is a fraction in 0..1")
+                Err(f) => test.assert(skfault.code(f) == "quantile_out_of_range")
+
+            test.case("a negative one likewise")
+            match sktdigest.quantiles(d, [0.5, -0.1])
+                Ok(_)  => test.fail("a quantile is a fraction in 0..1")
+                Err(f) => test.assert(skfault.code(f) == "quantile_out_of_range")
+
+    test.case("a compression below twenty has too few centroids to place a quantile")
+    match sktdigest.new(10.0)
+        Ok(_)  => test.fail("compression 10 has no useful error bound")
+        Err(f) => test.assert(skfault.code(f) == "compression_out_of_range")
+
+    test.case("and one above a thousand is a sorted copy of the data")
+    match sktdigest.new(2000.0)
+        Ok(_)  => test.fail("compression 2000 is not a sketch")
+        Err(f) => test.assert(skfault.code(f) == "compression_out_of_range")
+
+@test
+fn test_digests_merge_and_quantiles_do_not() [io]
+    match sktdigest.new(100.0)
+        Err(f) => test.fail("compression 100 is in range: ${f.message()}")
+        Ok(d0) =>
+            let a = sktdigest.add(d0, 1.0)
+            let b = sktdigest.add_weighted(d0, 3.0, 7)
+
+            test.case("a weighted observation counts as many")
+            test.assert(sktdigest.count_of(b) == 7)
+
+            test.case("the merge is the digest of both streams")
+            match sktdigest.merge(a, b)
+                Err(f) => test.fail("equal compressions merge: ${f.message()}")
+                Ok(u)  =>
+                    test.assert(sktdigest.count_of(u) == 8)
+                    test.assert(sktdigest.minimum_of(u) == 1.0)
+                    test.assert(sktdigest.maximum_of(u) == 3.0)
+                    test.assert(sktdigest.centroid_count(u) <= 100)
+
+            test.case("two different compressions have no shared error bound")
+            match sktdigest.new(200.0)
+                Err(f) => test.fail("compression 200 is in range: ${f.message()}")
+                Ok(c)  =>
+                    match sktdigest.merge(a, c)
+                        Ok(_)  => test.fail("different centroid bounds do not merge")
+                        Err(f) => test.assert(skfault.is_merge_fault(f))
+
+            test.case("and a digest round-trips through bytes")
+            match sktdigest.from_bytes(sktdigest.to_bytes(b))
+                Err(f) => test.fail("what `to_bytes` wrote reads back: ${f.message()}")
+                Ok(r)  => test.assert(sktdigest.count_of(r) == 7)
+
+    test.case("bytes that are not a digest are refused")
+    match sktdigest.from_bytes(bytes.from_str("nope"))
+        Ok(_)  => test.fail("this is not a serialised digest")
+        Err(f) => test.assert(skfault.code(f) == "bad_serialised_form")
+
+@test
+fn test_the_reservoir_keeps_the_items_and_the_caller_keeps_the_randomness() [io]
+    match skreservoir.new(2)
+        Err(f) => test.fail("a capacity of 2 is a reservoir: ${f.message()}")
+        Ok(r0) =>
+            test.case("while it is filling, every item is taken and no uniform is used")
+            test.assert(skreservoir.needs_uniform(r0) == false)
+            test.assert(skreservoir.keep_probability(r0) == 1.0)
+            let a = skreservoir.offer(r0, bytes.from_str("a"), 0.5)
+            let b = skreservoir.offer(a, bytes.from_str("b"), 0.5)
+            test.assert(list.len(skreservoir.sample(b)) == 2)
+            test.assert(skreservoir.is_full(b))
+
+            test.case("once full, the next offer needs a uniform and may replace")
+            test.assert(skreservoir.needs_uniform(b))
+            let c = skreservoir.offer(b, bytes.from_str("c"), 0.1)
+            test.assert(list.len(skreservoir.sample(c)) == 2)
+
+            test.case("the population the sample stands for is counted whatever is kept")
+            test.assert(skreservoir.seen_of(c) == 3)
+
+            test.case("and the keep probability is the sampling rate to report")
+            test.assert(skreservoir.keep_probability(c) == 0.5)
+
+            test.case("a merge is weighted by what each stream saw, and needs uniforms")
+            match skreservoir.merge(b, c, [0.1, 0.2])
+                Err(f) => test.fail("equal capacities merge: ${f.message()}")
+                Ok(u)  => test.assert(skreservoir.seen_of(u) == 5)
+
+            test.case("a reservoir round-trips through bytes with its seen count")
+            match skreservoir.from_bytes(skreservoir.to_bytes(c))
+                Err(f) => test.fail("what `to_bytes` wrote reads back: ${f.message()}")
+                Ok(x)  => test.assert(skreservoir.seen_of(x) == 3)
+
+    test.case("a reservoir of no capacity is refused")
+    match skreservoir.new(0)
+        Ok(_)  => test.fail("a sample of nothing is not a sample")
+        Err(f) => test.assert(skfault.code(f) == "capacity_not_positive")
