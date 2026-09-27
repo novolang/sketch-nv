@@ -1,20 +1,22 @@
 [package]
 name        = "sketch-nv"
-version     = "0.0.1"
-description = "HyperLogLog++, count-min, t-digest and reservoir sampling as mergeable, serialisable values with their published error bounds asserted as tests.  The 64-bit hash is the caller's, passed in rather than chosen here, and the sketch carries the caller's label for it so that merging two sketches fed through different hashes is refused."
+version     = "0.1.0"
+description = "HyperLogLog, count-min, t-digest and reservoir sampling as mergeable, serialisable values with their published error bounds asserted as tests.  The 64-bit hash is the caller's, passed in rather than chosen here, and the sketch carries the caller's label for it so that merging two sketches fed through different hashes is refused."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet, and the tests were written against the signatures rather
+# than by a consumer.
+stability   = "experimental"
 
-# `core`.  A sketch is arithmetic over an array.  The hash arrives as a
-# `fn(Bytes) -> Int` PARAMETER, and the reservoir's randomness arrives
+# `core`.  A sketch is arithmetic over a list.  The hash arrives as a
+# `fn(Bytes) -> Int` parameter, and the reservoir's randomness arrives
 # as uniform numbers the caller drew, so nothing here reads a clock,
 # opens a file or needs `[rand]`.
+#
+# There is no build for a microcontroller.  The registers, counters,
+# centroids and items are lists, and a build with no heap allocator
+# refuses a list.
 layer       = "core"
 
 category    = "tooling"
@@ -22,7 +24,7 @@ category    = "tooling"
 tags        = ["hyperloglog", "count-min", "t-digest", "reservoir-sampling", "streaming", "cardinality", "quantiles", "tooling"]
 repository  = "https://github.com/novolang/sketch-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.9.0"
+novo        = ">= 0.13.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

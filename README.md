@@ -11,12 +11,6 @@ crates [hyperloglogplus](https://docs.rs/hyperloglogplus) and
 [tdigest](https://docs.rs/tdigest), and the papers each algorithm comes
 from.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What a sketch is
 
 Counting a billion distinct visitors exactly takes a billion entries.
@@ -26,7 +20,7 @@ answer, not a hope.
 
 | Sketch | Question | Memory | Error |
 | --- | --- | --- | --- |
-| HyperLogLog++ | How many distinct items? | `2^precision` registers | `1.04 / sqrt(2^precision)` relative |
+| HyperLogLog | How many distinct items? | `2^precision` registers | `1.04 / sqrt(2^precision)` relative |
 | Count-min | How often did this item appear? | `width x depth` counters | Never low; high by `2/width` of the total, with probability `0.5^depth` |
 | t-digest | What is the *q*th percentile? | About `compression` centroids | Smallest at the extremes |
 | Reservoir | Show me *k* of the items | `k` items | A uniform sample, exactly |
@@ -86,17 +80,14 @@ fn main() [io]
                 Err(f) => println("cannot merge: ${f.message()}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: sketch-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
 | `skfault` | The eight ways a sketch or a merge can be refused. |
-| `skhll` | HyperLogLog++: distinct counting, its error bound and its merge. |
+| `skhll` | HyperLogLog over a 64-bit hash: distinct counting, its error bound and its merge. |
 | `skcms` | The count-min sketch: frequency estimation, its one-sided error, and the halving that ages it. |
 | `sktdigest` | The t-digest: quantiles, ranks, the exact extremes and the merge. |
 | `skreservoir` | Reservoir sampling: a uniform sample of the items themselves. |
@@ -136,9 +127,10 @@ hashed the item** for another reason, and should not pay twice.
 4. **HyperLogLog's precision is 4 to 18.** Below four the estimate is
    noise; above eighteen the registers are larger than the exact set
    would have been.
-5. **A HyperLogLog estimate is exact for small cardinalities**, which
-   is what HyperLogLog++'s bias correction is for. It becomes
-   approximate as the count grows.
+5. **A HyperLogLog estimate is exact for a handful of items.** The
+   estimator is Ertl's improved estimator (2017, algorithm 6), which
+   agrees with linear counting for small counts and needs no empirical
+   bias table. It becomes approximate as the count grows.
 6. **A count-min estimate is never too low.** It is too high by more
    than `error_bound x total` with probability at most
    `1 - confidence`.
@@ -167,19 +159,15 @@ hashed the item** for another reason, and should not pay twice.
     thousand errors.
 16. **A reservoir merge is weighted by what each stream saw.** An
     unweighted merge of a million-item stream and a ten-item stream is
-    uniform over nothing.
-
-## Running on a microcontroller
-
-Every module in this package builds for a microcontroller: no function
-performs any input or output, reads a clock, or draws a random number.
-A device that counts distinct neighbours or samples its own readings
-computes here and hands the sketch to whatever transport it has.
-
-Memory is the sketch's parameters and nothing else: `2^precision`
-registers, `width x depth` counters, about `compression` centroids, or
-`capacity` items. The t-digest is the only one that needs
-floating-point arithmetic.
+    uniform over nothing. It takes one uniform number per item held by
+    the reservoir that saw fewer items, and refuses a shorter list.
+17. **Every call that adds answers a new sketch.** The sketch passed in
+    is left unchanged, so an add copies what it changes. An add to a
+    HyperLogLog costs time in proportion to `2^precision` when it raises
+    a register, and an add to a count-min sketch in proportion to
+    `width x depth`.
+18. **An empty t-digest has no quantile.** `quantile` and `rank` answer
+    `NaN` for it, and a `NaN` observation is not added.
 
 ## What is not included
 
@@ -192,6 +180,10 @@ floating-point arithmetic.
 - **Wire compatibility with another implementation's serialised form.**
   `to_bytes` is this package's own, carrying the parameters a merge
   checks.
+- **A build for a microcontroller.** The registers, counters,
+  centroids and items are lists, and a build with no heap allocator
+  refuses a list. A device keeps the counts it needs and hands them to
+  a host that sketches.
 - **Theta sketches, and set intersection.** HyperLogLog unions
   exactly; intersecting two of them is a different family with a
   different error bound.
@@ -213,40 +205,40 @@ floating-point arithmetic.
 ```bash
 novo test tests/skhll_tests.nv       # the two hashed sketches and their bounds
 novo test tests/sktdigest_tests.nv   # quantiles, the exact extremes, and the reservoir
+novo test tests/skaccuracy_tests.nv  # every sketch against exact answers on seeded streams
+novo test tests/skedge_tests.nv      # refusals, messages and interpolation corner cases
+bash tests/coverage.sh               # line coverage over src/, merged across the suites
 ```
 
-The normative sources are the HyperLogLog++ paper (Heule, Nunkesser and
-Hall, 2013), Cormode and Muthukrishnan's count-min sketch (2005),
-Dunning and Ertl's t-digest, and Vitter's algorithm R for reservoir
-sampling. The reference implementations are Apache DataSketches and the
-Rust crates named above. The suite asserts that the relative error is
-`1.04 / sqrt(2^precision)`, that a merge across different precisions or
-different hash labels is refused rather than approximated, that a
-count-min estimate is never below the true count, that a t-digest's
-minimum and maximum are exact, that a quantile outside `0.0 ..= 1.0` is
-refused, and that a reservoir uses no random number until it is full.
+The normative sources are Flajolet, Fusy, Gandouet and Meunier's
+HyperLogLog (2007) with the 64-bit hash of Heule, Nunkesser and Hall's
+HyperLogLog++ (2013), Ertl's improved estimator (2017), Cormode and
+Muthukrishnan's count-min sketch (2005), Dunning and Ertl's t-digest
+(2019), and Vitter's algorithm R for reservoir sampling (1985).
 
-The tests compile today and fail at run, each on the
-`not implemented: sketch-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at a
-time as bodies land.
+The suites check these things:
 
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `skfault.SkFault`, `skhll.HllSketch`, `skcms.CmsSketch`, `sktdigest.TdSketch`, `skreservoir.RsSketch` | the types are declared |
-| `skfault.code`, `.is_merge_fault`, `SkFault.message` | no |
-| `skhll.new`, `.add`, `.add_hashed`, `.estimate`, `.relative_error` | no |
-| `skhll.merge`, `.is_empty`, `.register_count`, `.to_bytes`, `.from_bytes` | no |
-| `skcms.new`, `.with_error`, `.add`, `.add_hashed` | no |
-| `skcms.estimate`, `.estimate_hashed`, `.error_bound`, `.confidence` | no |
-| `skcms.merge`, `.halve`, `.to_bytes`, `.from_bytes` | no |
-| `sktdigest.new`, `.add`, `.add_weighted`, `.quantile`, `.quantiles`, `.rank` | no |
-| `sktdigest.merge`, `.count_of`, `.minimum_of`, `.maximum_of`, `.centroid_count` | no |
-| `sktdigest.to_bytes`, `.from_bytes` | no |
-| `skreservoir.new`, `.offer`, `.needs_uniform`, `.sample`, `.seen_of` | no |
-| `skreservoir.is_full`, `.keep_probability`, `.merge`, `.to_bytes`, `.from_bytes` | no |
+- HyperLogLog registers against hand-worked hashes, and estimates on
+  eight seeded streams against `tools/hll_reference.py`, a second
+  implementation of Ertl's estimator written from the paper. Each
+  estimate is also within three standard errors of the true count, and
+  the error over sixteen streams is within 1.5 times
+  `1.04 / sqrt(2^precision)`.
+- A merge of two HyperLogLog sketches equals the sketch of both streams,
+  register for register.
+- No count-min estimate is below the exact count, and the share of
+  items estimated further above than `error_bound x total` is at most
+  `1 - confidence`.
+- t-digest quantiles on a uniform and an exponential stream of 20,000
+  values, and on four merged digests, are within a rank tolerance of
+  the exact sorted stream: 0.0005 at the 0.1st and 99.9th percentiles,
+  0.01 at the median. The interpolation cases are worked by hand from
+  Dunning's reference implementation.
+- Over 2,000 seeded runs, every item of a stream is kept by a
+  reservoir within four standard deviations of the expected number of
+  times, and a merge of a 90-item stream with a 10-item stream keeps
+  about one item of the short one.
+- Every refusal, including every malformed serialised form.
 
 ## Licence
 
