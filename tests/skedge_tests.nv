@@ -1,0 +1,299 @@
+// skedge_tests.nv — the refusals, the messages, and the interpolation
+// cases a stream seldom reaches.
+//
+// The t-digest cases are built from serialised digests, so a centroid
+// can sit away from the exact minimum and maximum.  Every expected
+// value was worked by hand from the interpolation in Dunning's
+// reference implementation, which `sktdigest` follows.
+
+use std.test
+use skfault
+use skhll
+use skcms
+use sktdigest
+use skreservoir
+
+// A serialised digest: compression 100, the given count, minimum and
+// maximum, and centroids given as (mean, weight).
+fn digest_bytes(count: Int, low: Float, high: Float, cs: [(Float, Int)]) -> Bytes
+    var b = bytes.zeros(40 + 16 * list.len(cs))
+    bytes.set_u8(b, 0, 'S')
+    bytes.set_u8(b, 1, 'K')
+    bytes.set_u8(b, 2, 'T')
+    bytes.set_u8(b, 3, 1)
+    bytes.set_u64_be(b, 4, float.to_bits(100.0))
+    bytes.set_u64_be(b, 12, count)
+    bytes.set_u64_be(b, 20, float.to_bits(low))
+    bytes.set_u64_be(b, 28, float.to_bits(high))
+    bytes.set_u32_be(b, 36, list.len(cs))
+    for i in 0..list.len(cs)
+        let (mean, weight) = cs[i]
+        bytes.set_u64_be(b, 40 + 16 * i, float.to_bits(mean))
+        bytes.set_u64_be(b, 48 + 16 * i, weight)
+    b
+
+fn digest(count: Int, low: Float, high: Float, cs: [(Float, Int)]) -> sktdigest.TdSketch
+    let Ok(d) = sktdigest.from_bytes(digest_bytes(count, low, high, cs)) else todo("a well-formed digest")
+    d
+
+fn at(d: sktdigest.TdSketch, q: Float) -> Float
+    match sktdigest.quantile(d, q)
+        Ok(v)  => v
+        Err(_) => -1000.0
+
+fn close(a: Float, b: Float) -> Bool
+    math.abs(a - b) < 0.000000001
+
+fn refused<T>(r: Result<T, skfault.SkFault>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn refusal(r: Result<sktdigest.TdSketch, skfault.SkFault>) -> Str
+    match r
+        Ok(_)  => "accepted"
+        Err(f) => skfault.code(f)
+
+@test
+fn test_every_fault_has_a_message_and_a_code() [io]
+    let faults = [SkPrecisionOutOfRange(3), SkDimensionNotPositive(0, 4), SkCompressionOutOfRange(10.0),
+                  SkCapacityNotPositive(0), SkQuantileOutOfRange(99.0), SkShapeMismatch("p12", "p14"),
+                  SkHashMismatch("xxh3", "sha256"), SkBadSerialisedForm("short"), SkTooFewUniforms(2, 1)]
+    let codes = ["precision_out_of_range", "dimension_not_positive", "compression_out_of_range",
+                 "capacity_not_positive", "quantile_out_of_range", "shape_mismatch", "hash_mismatch",
+                 "bad_serialised_form", "too_few_uniforms"]
+    let words = ["precision 3", "width 0", "compression 10", "capacity 0", "quantile 99",
+                 "shape p12", "hash xxh3", "short", "needs 2"]
+    for i in 0..list.len(faults)
+        test.case("the ${codes[i]} fault")
+        test.assert_eq(skfault.code(faults[i]), codes[i])
+        test.assert(str.contains(faults[i].message(), words[i]))
+    test.case("only the two mismatches are merge faults")
+    test.assert(list.count(faults, f => skfault.is_merge_fault(f)) == 2)
+
+@test
+fn test_a_saturated_register_and_the_serialised_hll_refusals() [io]
+    let Ok(s) = skhll.new(4, "by-hand") else todo("precision 4 is in range")
+    test.case("a register at the largest rank is read by the tau term")
+    test.assert_eq(skhll.estimate(skhll.add_hashed(s, 7 << 60)), 1)
+    test.assert_eq(skhll.estimate(skhll.add_hashed(skhll.add_hashed(skhll.add_hashed(s, 7 << 60), (5 << 60) | (1 << 57)), -1)),
+        3)
+
+    test.case("every register at the largest rank is an unbounded estimate")
+    var full = s
+    for i in 0..16
+        full = skhll.add_hashed(full, i << 60)
+    test.assert_eq(skhll.estimate(full), math.max_int())
+
+    test.case("a precision above eighteen is refused")
+    test.assert(refused(skhll.new(19, "x")))
+
+    let good = skhll.to_bytes(s)
+    test.case("a header cut short")
+    test.assert(refused(skhll.from_bytes(bytes.slice(good, 0, 5))))
+    test.case("a version this package does not write")
+    var v2 = bytes.clone(good)
+    bytes.set_u8(v2, 3, 2)
+    test.assert(refused(skhll.from_bytes(v2)))
+    test.case("the wrong magic")
+    var magic = bytes.clone(good)
+    bytes.set_u8(magic, 2, 'C')
+    test.assert(refused(skhll.from_bytes(magic)))
+    test.case("a precision out of range")
+    var p3 = bytes.clone(good)
+    bytes.set_u8(p3, 4, 3)
+    test.assert(refused(skhll.from_bytes(p3)))
+    test.case("a length that disagrees with the precision")
+    test.assert(refused(skhll.from_bytes(bytes.slice(good, 0, bytes.len(good) - 1))))
+    test.case("a register above the largest rank")
+    var high = bytes.clone(good)
+    bytes.set_u8(high, bytes.len(good) - 1, 62)
+    test.assert(refused(skhll.from_bytes(high)))
+
+@test
+fn test_the_count_min_refusals_and_a_count_that_adds_nothing() [io]
+    let Ok(s) = skcms.new(16, 3, "a") else todo("a positive table")
+    test.case("a count below one adds nothing")
+    test.assert_eq(skcms.add_hashed(s, 5, 0).total, 0)
+    test.assert_eq(skcms.add_hashed(s, 5, -3).total, 0)
+
+    test.case("with_error refuses an epsilon or a delta that sizes no table")
+    test.assert(refused(skcms.with_error(0.0, 0.01, "a")))
+    test.assert(refused(skcms.with_error(0.01, 0.0, "a")))
+    test.assert(refused(skcms.with_error(0.01, 1.0, "a")))
+
+    test.case("a merge refuses a different shape and a different hash")
+    let Ok(wide) = skcms.new(32, 3, "a") else todo("a positive table")
+    let Ok(other) = skcms.new(16, 3, "b") else todo("a positive table")
+    match skcms.merge(s, wide)
+        Err(SkShapeMismatch(l, r)) => test.assert(l == "16x3" and r == "32x3")
+        _                          => test.fail("different widths do not line up")
+    match skcms.merge(s, other)
+        Ok(_)  => test.fail("different hashes put one item in different columns")
+        Err(f) => test.assert_eq(skfault.code(f), "hash_mismatch")
+
+    let good = skcms.to_bytes(skcms.add_hashed(s, 5, 9))
+    test.case("a round trip keeps the counters")
+    match skcms.from_bytes(good)
+        Err(f) => test.fail(f.message())
+        Ok(r)  => test.assert(r.counts == skcms.add_hashed(s, 5, 9).counts and r.hash_id == "a")
+    test.case("a header cut short")
+    test.assert(refused(skcms.from_bytes(bytes.slice(good, 0, 21))))
+    test.case("the wrong magic")
+    var magic = bytes.clone(good)
+    bytes.set_u8(magic, 0, 'X')
+    test.assert(refused(skcms.from_bytes(magic)))
+    test.case("a version this package does not write")
+    var v2 = bytes.clone(good)
+    bytes.set_u8(v2, 3, 9)
+    test.assert(refused(skcms.from_bytes(v2)))
+    test.case("a table of width zero")
+    var w0 = bytes.clone(good)
+    bytes.set_u32_be(w0, 4, 0)
+    test.assert(refused(skcms.from_bytes(w0)))
+    test.case("a length that disagrees with the table")
+    test.assert(refused(skcms.from_bytes(bytes.slice(good, 0, bytes.len(good) - 8))))
+
+@test
+fn test_the_digest_interpolates_as_the_reference_does() [io]
+    test.case("four single observations: the median of 1, 2, 3, 4 is the third")
+    let Ok(d0) = sktdigest.new(100.0) else todo("compression in range")
+    let four = sktdigest.add(sktdigest.add(sktdigest.add(sktdigest.add(d0, 1.0), 2.0), 3.0), 4.0)
+    test.assert(at(four, 0.5) == 3.0)
+    test.assert(at(four, 0.4) == 2.0)
+    test.case("and between two single observations the rank counts the left one whole")
+    test.assert(sktdigest.rank(four, 2.5) == 0.5)
+
+    test.case("two heavy centroids away from the extremes")
+    let two = digest(8, 0.0, 4.0, [(1.0, 4), (3.0, 4)])
+    test.assert(close(at(two, 0.15), 0.2))
+    test.assert(close(at(two, 0.25), 1.0))
+    test.assert(close(at(two, 0.5), 2.0))
+    test.assert(close(at(two, 0.85), 3.8))
+    test.assert(close(sktdigest.rank(two, 0.0), 0.0625))
+    test.assert(close(sktdigest.rank(two, 0.5), 0.1875))
+    test.assert(close(sktdigest.rank(two, 1.0), 0.25))
+    test.assert(close(sktdigest.rank(two, 2.0), 0.5))
+    test.assert(close(sktdigest.rank(two, 3.0), 0.9375))
+    test.assert(close(sktdigest.rank(two, 3.5), 0.8125))
+    test.assert(close(sktdigest.rank(two, 4.0), 0.9375))
+    test.assert(sktdigest.rank(two, -1.0) == 0.0)
+    test.assert(sktdigest.rank(two, 5.0) == 1.0)
+
+    test.case("a heavy centroid beside a single observation")
+    let lopsided = digest(5, 0.0, 3.0, [(1.0, 4), (3.0, 1)])
+    test.assert(close(sktdigest.rank(lopsided, 2.0), 0.6))
+    let other_way = digest(5, 1.0, 4.0, [(1.0, 1), (3.0, 4)])
+    test.assert(close(sktdigest.rank(other_way, 2.0), 0.4))
+
+    test.case("one centroid spread between the extremes")
+    let one = digest(2, 0.0, 2.0, [(1.0, 2)])
+    test.assert(close(sktdigest.rank(one, 0.5), 0.25))
+    test.assert(at(one, 0.3) == 1.0)
+    let point = digest(3, 5.0, 5.0, [(5.0, 3)])
+    test.assert(sktdigest.rank(point, 5.0) == 0.5)
+
+    test.case("an empty digest has no quantile and no rank")
+    test.assert(math.is_nan(at(d0, 0.5)))
+    test.assert(math.is_nan(sktdigest.rank(d0, 0.5)))
+
+    test.case("a weight below one and a NaN observation add nothing")
+    test.assert_eq(sktdigest.count_of(sktdigest.add_weighted(d0, 1.0, 0)), 0)
+    test.assert_eq(sktdigest.count_of(sktdigest.add(d0, math.nan())), 0)
+
+    test.case("merging with an empty digest answers the other one")
+    match sktdigest.merge(d0, two)
+        Ok(u)  => test.assert_eq(sktdigest.count_of(u), 8)
+        Err(f) => test.fail(f.message())
+    match sktdigest.merge(two, d0)
+        Ok(u)  => test.assert(sktdigest.maximum_of(u) == 4.0)
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_the_serialised_digest_refusals() [io]
+    let good = digest_bytes(8, 0.0, 4.0, [(1.0, 4), (3.0, 4)])
+    test.case("a header cut short")
+    test.assert_eq(refusal(sktdigest.from_bytes(bytes.slice(good, 0, 39))), "bad_serialised_form")
+    test.case("the wrong magic")
+    var magic = bytes.clone(good)
+    bytes.set_u8(magic, 1, 'Q')
+    test.assert_eq(refusal(sktdigest.from_bytes(magic)), "bad_serialised_form")
+    test.case("a version this package does not write")
+    var v2 = bytes.clone(good)
+    bytes.set_u8(v2, 3, 0)
+    test.assert_eq(refusal(sktdigest.from_bytes(v2)), "bad_serialised_form")
+    test.case("a compression out of range")
+    test.assert_eq(refusal(sktdigest.from_bytes(bytes.set_u64_be(bytes.clone(good), 4, float.to_bits(5.0)))),
+        "bad_serialised_form")
+    test.case("a length that disagrees with the centroid count")
+    test.assert_eq(refusal(sktdigest.from_bytes(bytes.slice(good, 0, 56))), "bad_serialised_form")
+    test.case("centroids out of order")
+    test.assert_eq(refusal(sktdigest.from_bytes(digest_bytes(8, 0.0, 4.0, [(3.0, 4), (1.0, 4)]))),
+        "bad_serialised_form")
+    test.case("a centroid with no weight")
+    test.assert_eq(refusal(sktdigest.from_bytes(digest_bytes(4, 0.0, 4.0, [(1.0, 4), (3.0, 0)]))),
+        "bad_serialised_form")
+    test.case("a count the centroids do not weigh")
+    test.assert_eq(refusal(sktdigest.from_bytes(digest_bytes(9, 0.0, 4.0, [(1.0, 4), (3.0, 4)]))),
+        "bad_serialised_form")
+
+@test
+fn test_the_reservoir_merge_and_serialised_refusals() [io]
+    let Ok(r) = skreservoir.new(3) else todo("a positive capacity")
+    let one = skreservoir.offer(r, bytes.from_str("a"), 0.0)
+    let two = skreservoir.offer(skreservoir.offer(r, bytes.from_str("b"), 0.0), bytes.from_str("c"), 0.0)
+
+    test.case("a merge of two that are not full keeps every item and uses no uniform")
+    match skreservoir.merge(one, two, [0.5])
+        Err(f) => test.fail(f.message())
+        Ok(u)  =>
+            test.assert_eq(list.len(skreservoir.sample(u)), 3)
+            test.assert_eq(skreservoir.seen_of(u), 3)
+
+    test.case("a merge with an empty reservoir needs no uniform")
+    match skreservoir.merge(r, two, [])
+        Err(f) => test.fail(f.message())
+        Ok(u)  => test.assert_eq(skreservoir.seen_of(u), 2)
+
+    test.case("fewer uniforms than the smaller sample holds are refused")
+    match skreservoir.merge(one, two, [])
+        Ok(_)  => test.fail("one item needs one uniform")
+        Err(f) => test.assert_eq(skfault.code(f), "too_few_uniforms")
+
+    test.case("different capacities are refused")
+    let Ok(big) = skreservoir.new(4) else todo("a positive capacity")
+    match skreservoir.merge(r, big, [])
+        Ok(_)  => test.fail("capacities differ")
+        Err(f) => test.assert(skfault.is_merge_fault(f))
+
+    test.case("a uniform outside 0 ..< 1 keeps nothing once the reservoir is full")
+    let full = skreservoir.offer(two, bytes.from_str("d"), 0.0)
+    let after = skreservoir.offer(full, bytes.from_str("e"), 1.5)
+    test.assert(skreservoir.sample(after) == skreservoir.sample(full))
+    test.assert_eq(skreservoir.seen_of(after), 4)
+
+    let good = skreservoir.to_bytes(full)
+    test.case("a round trip keeps the items in order")
+    match skreservoir.from_bytes(good)
+        Err(f) => test.fail(f.message())
+        Ok(x)  => test.assert(skreservoir.sample(x) == skreservoir.sample(full))
+    test.case("a header cut short")
+    test.assert(refused(skreservoir.from_bytes(bytes.slice(good, 0, 10))))
+    test.case("the wrong magic")
+    var magic = bytes.clone(good)
+    bytes.set_u8(magic, 2, 'H')
+    test.assert(refused(skreservoir.from_bytes(magic)))
+    test.case("a version this package does not write")
+    var v2 = bytes.clone(good)
+    bytes.set_u8(v2, 3, 3)
+    test.assert(refused(skreservoir.from_bytes(v2)))
+    test.case("more items held than the capacity")
+    var over = bytes.clone(good)
+    bytes.set_u32_be(over, 16, 9)
+    test.assert(refused(skreservoir.from_bytes(over)))
+    test.case("an item length cut off inside the header of an item")
+    test.assert(refused(skreservoir.from_bytes(bytes.slice(good, 0, 22))))
+    test.case("an item's bytes cut off")
+    test.assert(refused(skreservoir.from_bytes(bytes.slice(good, 0, 24))))
+    test.case("bytes after the last item")
+    test.assert(refused(skreservoir.from_bytes(bytes.concat([good, bytes.from_str("!")]))))

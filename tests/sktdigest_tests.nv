@@ -1,11 +1,9 @@
 // sktdigest_tests.nv — the API suite for the t-digest and the
 // reservoir.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// sketch-nv.sktdigest.<fn>` or `…skreservoir.<fn>`.  What is asserted
-// is that the extremes are exact, that a quantile outside the range is
-// refused rather than clamped, and that the reservoir's randomness
-// comes from the caller.
+// What is asserted is that the extremes are exact, that a quantile
+// outside the range is refused rather than clamped, and that the
+// reservoir's randomness comes from the caller.
 
 use std.test
 use sktdigest

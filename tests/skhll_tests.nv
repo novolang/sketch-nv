@@ -1,10 +1,8 @@
 // skhll_tests.nv — the API suite for the two hashed sketches.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// sketch-nv.skhll.<fn>` or `…skcms.<fn>`.  What is asserted is the
-// published error bound, that a merge of two sketches built
-// differently is refused rather than silently wrong, and that the
-// count-min sketch's error is one-sided.
+// What is asserted is the published error bound, that a merge of two
+// sketches built differently is refused rather than silently wrong, and
+// that the count-min sketch's error is one-sided.
 
 use std.test
 use skhll

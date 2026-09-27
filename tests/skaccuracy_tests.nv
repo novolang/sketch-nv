@@ -1,0 +1,312 @@
+// skaccuracy_tests.nv — the sketches against exact answers on seeded
+// streams.
+//
+// Every stream here is deterministic.  An item is the string
+// `"<seed>:<i>"`, and its hash is 64-bit FNV-1a followed by the
+// SplitMix64 finaliser, which is what `tools/hll_reference.py` computes
+// too.  The HyperLogLog estimates are compared with that script's
+// output exactly, and with the true count within the published error.
+// The count-min sketch, the t-digest and the reservoir are compared
+// with the exact counts, the sorted stream and the inclusion
+// frequencies the algorithms promise.
+
+use std.test
+use skhll
+use skcms
+use sktdigest
+use skreservoir
+
+// The SplitMix64 finaliser.
+@wrapping
+fn mix(x: Int) -> Int
+    var z = x
+    z = (z ^ (z >>> 30)) * -4658895280553007687
+    z = (z ^ (z >>> 27)) * -7723592293110705685
+    z ^ (z >>> 31)
+
+// 64-bit FNV-1a over the bytes, then the finaliser.
+@wrapping
+fn item_hash(b: Bytes) -> Int
+    var h = -3750763034362895579
+    for i in 0..bytes.len(b)
+        h = (h ^ (bytes.byte_at(b, i) ?? 0)) * 1099511628211
+    mix(h)
+
+fn item(seed: Int, i: Int) -> Bytes
+    bytes.from_str("${seed}:${i}")
+
+// A uniform number in `0.0 ..< 1.0` from the top 53 bits of a hash.
+fn uniform(seed: Int, i: Int) -> Float
+    (mix(seed * 1000003 + i) >>> 11) as Float / 9007199254740992.0
+
+// The constructors below are called with arguments in range, so the
+// refusal arm is never taken; `todo` marks it as unreachable.
+fn new_hll(p: Int) -> skhll.HllSketch
+    let Ok(s) = skhll.new(p, "fnv1a-splitmix") else todo("precision in range")
+    s
+
+fn new_cms(width: Int, depth: Int) -> skcms.CmsSketch
+    let Ok(s) = skcms.new(width, depth, "fnv1a-splitmix") else todo("a positive table")
+    s
+
+fn new_digest() -> sktdigest.TdSketch
+    let Ok(d) = sktdigest.new(100.0) else todo("compression in range")
+    d
+
+fn new_reservoir(k: Int) -> skreservoir.RsSketch
+    let Ok(r) = skreservoir.new(k) else todo("a positive capacity")
+    r
+
+fn hll_of(p: Int, seed: Int, n: Int) -> skhll.HllSketch
+    var s = new_hll(p)
+    for i in 0..n
+        s = skhll.add(s, item(seed, i), item_hash)
+    s
+
+fn relative(estimate: Int, truth: Int) -> Float
+    math.abs((estimate - truth) as Float / truth as Float)
+
+@test
+fn test_a_register_keeps_the_largest_rank_its_hashes_have() [io]
+    match skhll.new(4, "by-hand")
+        Err(f) => test.fail("precision 4 is in range: ${f.message()}")
+        Ok(s)  =>
+            test.case("the first four bits choose register 5, and two zeros then a one is rank 3")
+            let a = skhll.add_hashed(s, (5 << 60) | (1 << 57))
+            test.assert(a.registers[5] == 3)
+            test.assert(list.len(list.filter(a.registers, r => r != 0)) == 1)
+
+            test.case("a lower rank for the same register changes nothing")
+            let b = skhll.add_hashed(a, (5 << 60) | (1 << 59))
+            test.assert(b.registers[5] == 3)
+
+            test.case("a higher rank replaces it")
+            let c = skhll.add_hashed(b, (5 << 60) | 1)
+            test.assert(c.registers[5] == 60)
+
+            test.case("sixty zero bits after the index is the largest rank, 65 - precision")
+            let d = skhll.add_hashed(c, 7 << 60)
+            test.assert(d.registers[7] == 61)
+
+            test.case("a hash of all ones is register 15 at rank 1")
+            let e = skhll.add_hashed(d, -1)
+            test.assert(e.registers[15] == 1)
+
+            test.case("the input sketch is unchanged by an add")
+            test.assert(skhll.is_empty(s))
+
+@test
+fn test_the_estimates_match_a_second_implementation_of_the_estimator() [io]
+    // Each row is (precision, seed, items, the reference's estimate).
+    let rows = [(12, 1, 10, 10), (12, 2, 100, 101), (12, 3, 1000, 998), (12, 4, 10000, 9992),
+                (12, 5, 30000, 30009), (10, 6, 5000, 5015), (14, 7, 20000, 19868), (4, 8, 500, 442)]
+    for row in rows
+        let (p, seed, n, expected) = row
+        test.case("precision ${p}, ${n} distinct items")
+        let s = hll_of(p, seed, n)
+        test.assert_eq(skhll.estimate(s), expected)
+        test.case("and within three standard errors of the true count")
+        test.assert(relative(skhll.estimate(s), n) <= 3.0 * skhll.relative_error(s))
+
+@test
+fn test_the_relative_error_over_many_streams_is_the_published_one() [io]
+    test.case("sixteen streams of 5000 items at precision 10")
+    var squares = 0.0
+    for seed in 100..116
+        let s = hll_of(10, seed, 5000)
+        let e = relative(skhll.estimate(s), 5000)
+        squares = squares + e * e
+    let rms = math.sqrt(squares / 16.0)
+    test.assert(rms <= 1.5 * 1.04 / 32.0)
+
+    test.case("repeated items do not move the estimate")
+    let once = hll_of(12, 9, 2000)
+    var twice = once
+    for i in 0..2000
+        twice = skhll.add(twice, item(9, i), item_hash)
+    test.assert_eq(skhll.estimate(twice), skhll.estimate(once))
+
+@test
+fn test_a_merge_is_the_sketch_of_both_streams_register_for_register() [io]
+    var left = new_hll(12)
+    var right = left
+    var whole = left
+    for i in 0..6000
+        let x = item(11, i)
+        whole = skhll.add(whole, x, item_hash)
+        if i % 3 == 0
+            left = skhll.add(left, x, item_hash)
+        else
+            right = skhll.add(right, x, item_hash)
+    match skhll.merge(left, right)
+        Err(f) => test.fail("two sketches of one shape merge: ${f.message()}")
+        Ok(u)  =>
+            test.assert(u.registers == whole.registers)
+            test.assert_eq(skhll.estimate(u), skhll.estimate(whole))
+
+@test
+fn test_a_count_min_estimate_is_never_low_and_rarely_far_high() [io]
+    // 2000 items, item k counted 1 + (k * k) % 37 times, 5 rows of 272.
+    let items = 2000
+    var truth = list.zeros(items)
+    var s = new_cms(272, 5)
+    for k in 0..items
+        let n = 1 + k * k % 37
+        truth[k] = n
+        s = skcms.add(s, item(21, k), n, item_hash)
+    let total = list.sum(truth)
+    test.case("the total is every increment")
+    test.assert_eq(s.total, total)
+
+    test.case("no estimate is below the true count")
+    var low = 0
+    var far = 0
+    let slack = skcms.error_bound(s) * total as Float
+    for k in 0..items
+        let e = skcms.estimate(s, item(21, k), item_hash)
+        if e < truth[k]
+            low = low + 1
+        if ((e - truth[k]) as Float) > slack
+            far = far + 1
+    test.assert_eq(low, 0)
+
+    test.case("and the share further above than the bound is at most 1 - confidence")
+    test.assert(far as Float / items as Float <= 1.0 - skcms.confidence(s))
+
+    test.case("halving halves every counter, so the estimate stays at least half the truth")
+    let h = skcms.halve(s)
+    for k in 0..items
+        test.assert(skcms.estimate(h, item(21, k), item_hash) >= truth[k] / 2)
+
+    test.case("a merge is counter by counter the sketch of both streams")
+    let even = skcms.add(s, item(21, 0), 5, item_hash)
+    match skcms.merge(s, skcms.add_hashed(s, item_hash(item(21, 0)), 5))
+        Err(f) => test.fail("equal shapes merge: ${f.message()}")
+        Ok(u)  =>
+            test.assert_eq(u.total, 2 * total + 5)
+            test.assert(skcms.estimate(u, item(21, 0), item_hash) >= 2 * truth[0] + 5)
+            test.assert(skcms.estimate(even, item(21, 0), item_hash) >= truth[0] + 5)
+
+// The fraction of `sorted` at or below `v`.
+fn exact_rank(sorted: [Float], v: Float) -> Float
+    list.count(sorted, x => x <= v) as Float / list.len(sorted) as Float
+
+fn check_quantiles(d: sktdigest.TdSketch, sorted: [Float]) [io]
+    let qs = [0.001, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 0.999]
+    let tolerances = [0.0005, 0.002, 0.005, 0.008, 0.01, 0.008, 0.005, 0.002, 0.0005]
+    match sktdigest.quantiles(d, qs)
+        Err(f) => test.fail("all are quantiles: ${f.message()}")
+        Ok(vs) =>
+            for i in 0..list.len(qs)
+                test.case("the ${qs[i]} quantile is within ${tolerances[i]} of it in rank")
+                test.assert(math.abs(exact_rank(sorted, vs[i]) - qs[i]) <= tolerances[i])
+                test.case("and the rank of the true ${qs[i]} quantile is within the same")
+                let true_value = sorted[(qs[i] * list.len(sorted) as Float) as Int]
+                test.assert(math.abs(sktdigest.rank(d, true_value) - qs[i]) <= tolerances[i])
+
+@test
+fn test_digest_quantiles_are_close_in_rank_and_closest_at_the_tails() [io]
+    let n = 20000
+    var d = new_digest()
+    var values: [Float] = []
+    for i in 0..n
+        let v = uniform(31, i)
+        list.push(values, v)
+        d = sktdigest.add(d, v)
+    list.sort(values)
+    test.case("a uniform stream of 20000")
+    test.assert_eq(sktdigest.count_of(d), n)
+    test.assert(sktdigest.centroid_count(d) <= 100)
+    test.assert(sktdigest.minimum_of(d) == values[0])
+    test.assert(sktdigest.maximum_of(d) == values[n - 1])
+    check_quantiles(d, values)
+
+    test.case("an exponential stream, skewed to the right")
+    var e = new_digest()
+    var skewed: [Float] = []
+    for i in 0..n
+        let v = 0.0 - math.log(1.0 - uniform(32, i))
+        list.push(skewed, v)
+        e = sktdigest.add(e, v)
+    list.sort(skewed)
+    check_quantiles(e, skewed)
+
+fn median(d: sktdigest.TdSketch) -> Float
+    match sktdigest.quantile(d, 0.5)
+        Ok(v)  => v
+        Err(_) => -1.0
+
+@test
+fn test_merged_digests_answer_as_one_digest_does() [io]
+    let n = 20000
+    let empty = new_digest()
+    var parts = [empty, empty, empty, empty]
+    var values: [Float] = []
+    for i in 0..n
+        let v = uniform(41, i) * 10.0
+        list.push(values, v)
+        parts[i % 4] = sktdigest.add(parts[i % 4], v)
+    list.sort(values)
+    var whole = parts[0]
+    for k in 1..4
+        match sktdigest.merge(whole, parts[k])
+            Ok(u)  =>
+                whole = u
+            Err(f) => test.fail("equal compressions merge: ${f.message()}")
+    test.case("four quarters merged count every observation")
+    test.assert_eq(sktdigest.count_of(whole), n)
+    test.assert(sktdigest.centroid_count(whole) <= 100)
+    check_quantiles(whole, values)
+
+    test.case("and a merged digest survives a round trip through bytes")
+    match sktdigest.from_bytes(sktdigest.to_bytes(whole))
+        Err(f) => test.fail("what `to_bytes` wrote reads back: ${f.message()}")
+        Ok(r)  =>
+            test.assert(median(r) == median(whole))
+            test.assert_eq(sktdigest.centroid_count(r), sktdigest.centroid_count(whole))
+
+@test
+fn test_every_item_is_equally_likely_to_be_in_the_sample() [io]
+    // 2000 runs of a stream of 100 items into a reservoir of 10.  Each
+    // item should be kept in about 200 of them; the binomial standard
+    // deviation is about 13.4.
+    let runs = 2000
+    var kept = list.zeros(100)
+    for run in 0..runs
+        var r = new_reservoir(10)
+        for i in 0..100
+            r = skreservoir.offer(r, bytes.u8(i), uniform(run, i))
+        for x in skreservoir.sample(r)
+            let i = bytes.byte_at(x, 0) ?? 0
+            kept[i] = kept[i] + 1
+    test.case("every item is kept within four standard deviations of 200 times")
+    test.assert(list.all(kept, k => k >= 146 and k <= 254))
+    test.case("and the sample is always full")
+    test.assert_eq(list.sum(kept), runs * 10)
+
+@test
+fn test_a_merge_is_weighted_by_what_each_stream_saw() [io]
+    // Stream A offers 90 items and stream B 10, each into a reservoir
+    // of 10.  A uniform sample of the union holds one item of B on
+    // average, where an unweighted merge would hold five.
+    let runs = 2000
+    var from_b = 0
+    for run in 0..runs
+        var a = new_reservoir(10)
+        var b = a
+        for i in 0..90
+            a = skreservoir.offer(a, bytes.u8(i), uniform(run, i))
+        for i in 90..100
+            b = skreservoir.offer(b, bytes.u8(i), uniform(run, i))
+        var us: [Float] = []
+        for k in 0..10
+            list.push(us, uniform(run + 50000, k))
+        match skreservoir.merge(a, b, us)
+            Err(f) => test.fail("equal capacities merge: ${f.message()}")
+            Ok(u)  =>
+                for x in skreservoir.sample(u)
+                    if (bytes.byte_at(x, 0) ?? 0) >= 90
+                        from_b = from_b + 1
+    let mean = from_b as Float / runs as Float
+    test.case("the union's sample holds about one item of the short stream")
+    test.assert(mean >= 0.85 and mean <= 1.15)
