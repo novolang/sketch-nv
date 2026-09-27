@@ -1,42 +1,41 @@
-// skhll.nv — HyperLogLog++, for counting distinct things.
-//
-// WHAT IT IS
+// skhll.nv — HyperLogLog, for counting distinct things.
 //
 // Counting distinct items exactly costs memory proportional to the
-// number of distinct items.  HyperLogLog counts them approximately in
-// a fixed amount of memory — a few kilobytes for a billion items —
-// with a relative error that depends only on the size of that memory.
-// HyperLogLog++ is Google's 2013 refinement: a 64-bit hash, a bias
-// correction for small cardinalities, and a sparse representation.
+// number of distinct items.  HyperLogLog counts them approximately in a
+// fixed amount of memory, with a relative error that depends only on
+// the size of that memory (Flajolet, Fusy, Gandouet and Meunier, 2007).
+// The sketch here follows HyperLogLog++ (Heule, Nunkesser and Hall,
+// 2013) in taking a 64-bit hash, so no correction for hash collisions
+// is needed at any count a program will reach.
 //
-// The idea is that the position of the leftmost one-bit in a random
-// hash is a witness to how many distinct values have been seen: one in
-// two hashes begins with a one, one in four with a zero-one, and so
-// on.  The sketch keeps the largest such position per register and
-// averages harmonically across registers.
+// The first `precision` bits of the hash choose a register.  The
+// register keeps the largest rank seen for it, where the rank of a hash
+// is the position of the first one-bit in the bits that remain.  One
+// hash in two has rank 1, one in four has rank 2, and so on, so the
+// largest rank is a witness to how many distinct hashes have landed.
 //
-// THE HASH IS THE CALLER'S, AND THE SKETCH REMEMBERS WHICH
+// The estimate is Ertl's improved estimator ("New cardinality
+// estimation algorithms for HyperLogLog sketches", 2017, algorithm 6).
+// It reads the histogram of register values, needs no empirical bias
+// table, and is unbiased from an empty sketch to counts far beyond
+// `2^precision`.  For a handful of items it agrees with linear
+// counting, which is why a small count comes out exact.
 //
-// Every operation that reads an item takes the hash as a parameter, so
-// this package chooses no hash function for anyone: a caller that
-// already hashes its keys for sharding uses the same hash here and
-// pays for one pass instead of two.
-//
-// The sketch does NOT carry the function — that would make it
-// unserialisable and untestable — but it does carry a LABEL the caller
-// gave, and a merge of two sketches with different labels is refused.
-// Two hashes put the same item in different registers, so merging
-// their sketches counts it twice.
-//
-// THE ERROR BOUND IS PUBLISHED, AND IT IS A TEST
-//
-// The relative standard error is `1.04 / sqrt(2^precision)`: 1.6% at
-// precision 12, 0.8% at 14.  `relative_error` answers it, and the
-// suite asserts the estimate stays within it.
+// The hash is the caller's.  The sketch carries a label for it rather
+// than the function, so that it can be serialised, and a merge of two
+// sketches with different labels is refused: two hashes put the same
+// item in different registers, and the merged sketch would count it
+// twice.
 
 use skfault
 
-// A HyperLogLog++ sketch.
+// The serialised form: the three bytes `SKH`, a version byte, the
+// precision, the label's length as two bytes big-endian, the label in
+// UTF-8, and one byte per register.
+const HEADER: Int = 7
+const FORM_VERSION: Int = 1
+
+// A HyperLogLog sketch over a 64-bit hash.
 pub struct HllSketch
     // The precision: how many leading bits of the hash choose the
     // register.  `2^precision` registers, 4 ..= 18.
@@ -44,8 +43,10 @@ pub struct HllSketch
     // The label the caller gave for the hash the sketch was fed
     // through.  Compared on a merge; never interpreted.
     hash_id: Str
-    // One register per bucket, each holding the largest leading-zero
-    // count seen for it.
+    // One register per bucket, each holding the largest rank seen for
+    // it: one more than the count of leading zeros in the hash bits
+    // after the first `precision`, from 0 for an untouched register to
+    // `65 - precision`.
     registers: [Int]
 
 // An empty sketch.
@@ -67,13 +68,19 @@ pub struct HllSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn new(precision: Int, hash_id: Str) -> Result<HllSketch, skfault.SkFault>
-    todo("sketch-nv.skhll.new")
+    if precision < 4 or precision > 18
+        return Err(SkPrecisionOutOfRange(precision))
+    Ok(HllSketch { precision: precision, hash_id: hash_id, registers: list.zeros(1 << precision) })
 
 // The sketch with one item added.
 //
 // `hash` is the caller's 64-bit hash.  The same function must be used
 // for every item of one sketch: a sketch fed through two hashes counts
 // some items twice.
+//
+// The sketch given is left unchanged.  When the item raises a register
+// the registers are copied, so such an add costs time in proportion to
+// `2^precision`.
 //
 // ```novo
 // use skhll
@@ -89,7 +96,7 @@ pub fn new(precision: Int, hash_id: Str) -> Result<HllSketch, skfault.SkFault>
 //     7
 // ```
 pub fn add(s: HllSketch, item: Bytes, hash: fn(Bytes) -> Int) -> HllSketch
-    todo("sketch-nv.skhll.add")
+    add_hashed(s, hash(item))
 
 // The sketch with one already-hashed item added.
 //
@@ -106,14 +113,23 @@ pub fn add(s: HllSketch, item: Bytes, hash: fn(Bytes) -> Int) -> HllSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn add_hashed(s: HllSketch, hashed: Int) -> HllSketch
-    todo("sketch-nv.skhll.add_hashed")
+    let p = s.precision
+    let index = hashed >>> (64 - p)
+    let r = rank(hashed, p)
+    if r <= s.registers[index]
+        return s
+    var registers = s.registers[:]
+    registers[index] = r
+    HllSketch { precision: p, hash_id: s.hash_id, registers: registers }
 
 // How many distinct items the sketch estimates it has seen.
 //
 // Approximate, within the relative error the precision fixes.  An
-// empty sketch answers `0` exactly, and a sketch that has seen a
-// handful of items answers exactly, because HyperLogLog++'s bias
-// correction is exact in that range.
+// empty sketch answers `0`, and a sketch that has seen a handful of
+// items answers their count exactly, because the estimator agrees with
+// linear counting in that range.  An estimate beyond the largest `Int`,
+// which only a hash that is not uniform can produce, answers the
+// largest `Int`.
 //
 // ```novo
 // use skhll
@@ -124,7 +140,20 @@ pub fn add_hashed(s: HllSketch, hashed: Int) -> HllSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn estimate(s: HllSketch) -> Int
-    todo("sketch-nv.skhll.estimate")
+    let m = list.len(s.registers)
+    let q = 64 - s.precision
+    let counts = histogram(s.registers, q)
+    if counts[0] == m
+        return 0
+    let mf = m as Float
+    var z = mf * tau(1.0 - counts[q + 1] as Float / mf)
+    var k = q
+    while k >= 1
+        z = 0.5 * (z + counts[k] as Float)
+        k = k - 1
+    z = z + mf * sigma(counts[0] as Float / mf)
+    let alpha = 1.0 / (2.0 * math.log(2.0))
+    math.checked_to_int(math.round(alpha * mf * mf / z)) ?? math.max_int()
 
 // The relative standard error the sketch's precision gives:
 // `1.04 / sqrt(2^precision)`.
@@ -142,7 +171,7 @@ pub fn estimate(s: HllSketch) -> Int
 //         Err(f) => println(f.message())
 // ```
 pub fn relative_error(s: HllSketch) -> Float
-    todo("sketch-nv.skhll.relative_error")
+    1.04 / math.sqrt((1 << s.precision) as Float)
 
 // The sketch that has seen everything both have.
 //
@@ -165,7 +194,15 @@ pub fn relative_error(s: HllSketch) -> Float
 //                 Err(f) => println(f.message())
 // ```
 pub fn merge(a: HllSketch, b: HllSketch) -> Result<HllSketch, skfault.SkFault>
-    todo("sketch-nv.skhll.merge")
+    if a.precision != b.precision
+        return Err(SkShapeMismatch("p${a.precision}", "p${b.precision}"))
+    if a.hash_id != b.hash_id
+        return Err(SkHashMismatch(a.hash_id, b.hash_id))
+    var registers = a.registers[:]
+    for i in 0..list.len(registers)
+        if b.registers[i] > registers[i]
+            registers[i] = b.registers[i]
+    Ok(HllSketch { precision: a.precision, hash_id: a.hash_id, registers: registers })
 
 // Whether the sketch has seen nothing.
 //
@@ -178,7 +215,7 @@ pub fn merge(a: HllSketch, b: HllSketch) -> Result<HllSketch, skfault.SkFault>
 //         Err(f) => println(f.message())
 // ```
 pub fn is_empty(s: HllSketch) -> Bool
-    todo("sketch-nv.skhll.is_empty")
+    list.all(s.registers, r => r == 0)
 
 // How many registers the sketch has: `2^precision`.
 //
@@ -191,7 +228,7 @@ pub fn is_empty(s: HllSketch) -> Bool
 //         Err(f) => println(f.message())
 // ```
 pub fn register_count(s: HllSketch) -> Int
-    todo("sketch-nv.skhll.register_count")
+    list.len(s.registers)
 
 // The sketch as bytes, for a store or a wire.
 //
@@ -208,7 +245,20 @@ pub fn register_count(s: HllSketch) -> Int
 //         Err(f) => println(f.message())
 // ```
 pub fn to_bytes(s: HllSketch) -> Bytes
-    todo("sketch-nv.skhll.to_bytes")
+    let label = bytes.from_str(s.hash_id)
+    let n = bytes.len(label)
+    let m = list.len(s.registers)
+    var out = bytes.zeros(HEADER + n + m)
+    bytes.set_u8(out, 0, 'S')
+    bytes.set_u8(out, 1, 'K')
+    bytes.set_u8(out, 2, 'H')
+    bytes.set_u8(out, 3, FORM_VERSION)
+    bytes.set_u8(out, 4, s.precision)
+    bytes.set_u16_be(out, 5, n)
+    bytes.copy_into(out, HEADER, label, 0, n)
+    for i in 0..m
+        bytes.set_u8(out, HEADER + n + i, s.registers[i])
+    out
 
 // A sketch read back from bytes.
 //
@@ -221,4 +271,77 @@ pub fn to_bytes(s: HllSketch) -> Bytes
 //         Err(f) => println(f.message())
 // ```
 pub fn from_bytes(b: Bytes) -> Result<HllSketch, skfault.SkFault>
-    todo("sketch-nv.skhll.from_bytes")
+    let total = bytes.len(b)
+    if total < HEADER
+        return Err(SkBadSerialisedForm("${total} bytes is shorter than the ${HEADER}-byte header"))
+    if byte(b, 0) != 'S' or byte(b, 1) != 'K' or byte(b, 2) != 'H'
+        return Err(SkBadSerialisedForm("the header does not begin with SKH"))
+    if byte(b, 3) != FORM_VERSION
+        return Err(SkBadSerialisedForm("form version ${byte(b, 3)} is not ${FORM_VERSION}"))
+    let p = byte(b, 4)
+    if p < 4 or p > 18
+        return Err(SkBadSerialisedForm("precision ${p} is outside 4 ..= 18"))
+    let n = bytes.u16_be_at(b, 5) ?? 0
+    let m = 1 << p
+    if total != HEADER + n + m
+        return Err(SkBadSerialisedForm("${total} bytes, where precision ${p} and a ${n}-byte label need ${HEADER + n + m}"))
+    let label = bytes.to_str(bytes.slice(b, HEADER, HEADER + n))
+    let top = 65 - p
+    var registers = list.zeros(m)
+    for i in 0..m
+        let r = byte(b, HEADER + n + i)
+        if r > top
+            return Err(SkBadSerialisedForm("register ${i} holds ${r}, above the largest rank ${top}"))
+        registers[i] = r
+    Ok(HllSketch { precision: p, hash_id: label, registers: registers })
+
+// The rank of a hash: one more than the number of leading zeros in the
+// `64 - p` bits after the register index, and `65 - p` when all of
+// them are zero.
+fn rank(hashed: Int, p: Int) -> Int
+    let rest = hashed << p
+    if rest == 0
+        return 65 - p
+    bits.leading_zeros(rest) + 1
+
+// How many registers hold each value `0 ..= q + 1`.
+fn histogram(registers: [Int], q: Int) -> [Int]
+    var counts = list.zeros(q + 2)
+    for r in registers
+        counts[r] = counts[r] + 1
+    counts
+
+// Ertl's sigma: the correction for registers still at zero, the sum
+// `x + sum over k >= 1 of x^(2^k) * 2^(k-1)`.  Called with `x < 1`,
+// since a sketch whose registers are all zero answers before this.
+fn sigma(x0: Float) -> Float
+    var x = x0
+    var y = 1.0
+    var z = x0
+    var previous = -1.0
+    while z != previous
+        previous = z
+        x = x * x
+        z = z + x * y
+        y = y + y
+    z
+
+// Ertl's tau: the correction for registers at the largest rank, the
+// sum `(1 - x - sum over k >= 1 of (1 - x^(2^-k))^2 * 2^-k) / 3`.
+fn tau(x0: Float) -> Float
+    if x0 == 0.0 or x0 == 1.0
+        return 0.0
+    var x = x0
+    var y = 1.0
+    var z = 1.0 - x0
+    var previous = -1.0
+    while z != previous
+        previous = z
+        x = math.sqrt(x)
+        y = y * 0.5
+        z = z - (1.0 - x) * (1.0 - x) * y
+    z / 3.0
+
+// One byte of a buffer already checked to be long enough.
+fn byte(b: Bytes, i: Int) -> Int
+    bytes.byte_at(b, i) ?? 0

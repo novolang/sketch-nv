@@ -1,37 +1,40 @@
 // sktdigest.nv — the t-digest, for quantiles.
 //
-// WHAT IT IS
+// A t-digest answers "what is the 99th percentile" over a stream in a
+// few kilobytes, with an error that is smallest at the extremes (Dunning
+// and Ertl, "Computing extremely accurate quantiles using t-digests",
+// 2019).  It keeps a list of centroids, each a mean and a weight, and
+// lets a centroid grow large in the middle of the distribution while
+// forcing it to stay small at the ends.  No bucket boundary is chosen
+// in advance, and the 99.9th percentile is accurate to a few parts in
+// a thousand.
 //
-// A t-digest answers "what is the 99th percentile" over a stream, in a
-// few kilobytes, with an error that is smallest exactly where it
-// matters: at the extremes.  It keeps a set of CENTROIDS, each a mean
-// and a weight, and it allows a centroid to be large in the middle of
-// the distribution and forces it to be small at the ends.  Ted Dunning
-// and Otmar Ertl's paper is the reference.
+// This is the merging variant.  The size of a centroid is bounded by
+// the scale function `k1(q) = compression / (2 pi) * asin(2q - 1)`: a
+// run of centroids may be merged into one only while the `k1` of its
+// right edge is within 1 of the `k1` of its left edge.  A new
+// observation is inserted as a centroid of its own, and when the list
+// grows past the compression the whole list is merged in one pass.
+// The count of centroids therefore never exceeds the compression.
 //
-// The consequence is the property no fixed-bucket histogram has: the
-// 99.9th percentile is accurate to a few parts in a thousand without
-// anyone having chosen a bucket boundary in advance.  A Prometheus
-// histogram needs its buckets decided before the first observation,
-// and a bucket chosen wrongly cannot be fixed without losing the
-// history.
-//
-// COMPRESSION IS THE ONE KNOB
-//
-// It bounds the number of centroids, and with it both the memory and
-// the error.  100 is the usual choice: a few kilobytes, and about
-// 1% relative error at the median falling to about 0.1% at the 99th
-// percentile.
-//
-// MERGEABLE, AND THAT IS WHY IT IS HERE
+// The quantile and the rank interpolate between centroid means as
+// Dunning's reference implementation does, treating a centroid of
+// weight one as a single observation at its mean.  The smallest and
+// the largest observation are kept exactly.
 //
 // Two digests merge into the digest of both streams.  Quantiles
-// computed per machine cannot be averaged — the mean of two 99th
-// percentiles is not the 99th percentile of anything — so a service
-// that reports quantiles per instance either merges digests or reports
-// numbers nobody can aggregate.
+// computed per machine cannot be averaged, since the mean of two 99th
+// percentiles is not the 99th percentile of anything.
 
 use skfault
+
+// The serialised form: the three bytes `SKT`, a version byte, then the
+// compression, the count, the minimum and the maximum as eight bytes
+// each, the centroid count as four, and every centroid as its mean and
+// its weight, eight bytes each.  Every number is big-endian, and every
+// float is its IEEE 754 bit pattern.
+const HEADER: Int = 40
+const FORM_VERSION: Int = 1
 
 // One centroid: a mean and how many observations it stands for.
 pub struct TdCentroid
@@ -69,9 +72,14 @@ pub struct TdSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn new(compression: Float) -> Result<TdSketch, skfault.SkFault>
-    todo("sketch-nv.sktdigest.new")
+    if not (compression >= 20.0 and compression <= 1000.0)
+        return Err(SkCompressionOutOfRange(compression))
+    Ok(TdSketch { compression: compression, centroids: [], count: 0, minimum: 0.0, maximum: 0.0 })
 
 // The digest with one observation added.
+//
+// The digest given is left unchanged.  A `NaN` observation has no
+// place in the order and adds nothing.
 //
 // ```novo
 // use sktdigest
@@ -82,12 +90,13 @@ pub fn new(compression: Float) -> Result<TdSketch, skfault.SkFault>
 //         Err(f) => println(f.message())
 // ```
 pub fn add(d: TdSketch, value: Float) -> TdSketch
-    todo("sketch-nv.sktdigest.add")
+    add_weighted(d, value, 1)
 
 // The digest with one observation added `weight` times.
 //
-// For a caller that has already counted duplicates — a histogram being
-// converted, a run-length-encoded stream.
+// For a caller that has already counted duplicates, such as a
+// histogram being converted or a run-length-encoded stream.  A weight
+// below one adds nothing.
 //
 // ```novo
 // use sktdigest
@@ -98,7 +107,35 @@ pub fn add(d: TdSketch, value: Float) -> TdSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn add_weighted(d: TdSketch, value: Float, weight: Int) -> TdSketch
-    todo("sketch-nv.sktdigest.add_weighted")
+    if weight < 1 or math.is_nan(value)
+        return d
+    var centroids: [TdCentroid] = []
+    var placed = false
+    for c in d.centroids
+        if not placed and value < c.mean
+            list.push(centroids, TdCentroid { mean: value, weight: weight })
+            placed = true
+        list.push(centroids, c)
+    if not placed
+        list.push(centroids, TdCentroid { mean: value, weight: weight })
+    let low = if d.count == 0 or value < d.minimum
+        value
+    else
+        d.minimum
+    let high = if d.count == 0 or value > d.maximum
+        value
+    else
+        d.maximum
+    let count = d.count + weight
+    let kept = if (list.len(centroids) as Float) > d.compression
+        compress(centroids, count, d.compression)
+    else
+        centroids
+    TdSketch { compression: d.compression,
+        centroids: kept,
+        count: count,
+        minimum: low,
+        maximum: high }
 
 // The value at a quantile.
 //
@@ -108,7 +145,8 @@ pub fn add_weighted(d: TdSketch, value: Float, weight: Int) -> TdSketch
 //
 // Refused for a quantile outside the range, rather than clamped: a
 // caller that asked for the 99th percentile as `99.0` has a bug, and
-// clamping would answer the maximum and hide it.
+// clamping would answer the maximum and hide it.  An empty digest
+// answers `NaN`, since it has no observations to place.
 //
 // ```novo
 // use sktdigest
@@ -122,14 +160,17 @@ pub fn add_weighted(d: TdSketch, value: Float, weight: Int) -> TdSketch
 //                 Err(f) => println(f.message())
 // ```
 pub fn quantile(d: TdSketch, quantile: Float) -> Result<Float, skfault.SkFault>
-    todo("sketch-nv.sktdigest.quantile")
+    if not (quantile >= 0.0 and quantile <= 1.0)
+        return Err(SkQuantileOutOfRange(quantile))
+    Ok(value_at(d, quantile))
 
 // Where a value falls in the distribution, as a fraction in
 // `0.0 ..= 1.0`.
 //
 // The inverse of `quantile`, and the question behind "is this request
 // unusually slow": a value at rank 0.999 is slower than 99.9% of what
-// the digest has seen.
+// the digest has seen.  A value below the minimum answers `0.0`, one
+// above the maximum `1.0`, and an empty digest `NaN`.
 //
 // ```novo
 // use sktdigest
@@ -140,14 +181,44 @@ pub fn quantile(d: TdSketch, quantile: Float) -> Result<Float, skfault.SkFault>
 //         Err(f) => println(f.message())
 // ```
 pub fn rank(d: TdSketch, value: Float) -> Float
-    todo("sketch-nv.sktdigest.rank")
+    let n = list.len(d.centroids)
+    if n == 0
+        return math.nan()
+    if value < d.minimum
+        return 0.0
+    if value > d.maximum
+        return 1.0
+    let total = d.count as Float
+    if n == 1
+        if d.maximum - d.minimum <= 0.0
+            return 0.5
+        return (value - d.minimum) / (d.maximum - d.minimum)
+    let first = d.centroids[0]
+    let last = d.centroids[n - 1]
+    if value < first.mean
+        return below_first(d, first, value, total)
+    if value > last.mean
+        return above_last(d, last, value, total)
+    var so_far = 0.0
+    for i in 0..n - 1
+        let left = d.centroids[i]
+        let right = d.centroids[i + 1]
+        if left.mean == value
+            // The centroids are sorted, so every one at this mean
+            // follows this one.
+            let at = list.fold(d.centroids, (w, c) => (if c.mean == value then w + c.weight else w), 0)
+            return (so_far + at as Float / 2.0) / total
+        if value < right.mean
+            return (so_far + between(left, right, value)) / total
+        so_far = so_far + left.weight as Float
+    1.0 - 0.5 / total
 
 // Several quantiles at once.
 //
-// One pass over the centroids instead of one per quantile, which is
-// what a metrics export does: a service reporting the 50th, 90th, 99th
-// and 99.9th asks four questions of one digest.  Refused if any
-// quantile is out of range.
+// The answers are those `quantile` gives, in the order asked.  A
+// service reporting the 50th, 90th, 99th and 99.9th percentiles asks
+// four questions of one digest in one call.  Refused, naming the first
+// offender, if any quantile is out of range.
 //
 // ```novo
 // use sktdigest
@@ -161,7 +232,10 @@ pub fn rank(d: TdSketch, value: Float) -> Float
 //                 Err(f) => println(f.message())
 // ```
 pub fn quantiles(d: TdSketch, qs: [Float]) -> Result<[Float], skfault.SkFault>
-    todo("sketch-nv.sktdigest.quantiles")
+    for q in qs
+        if not (q >= 0.0 and q <= 1.0)
+            return Err(SkQuantileOutOfRange(q))
+    Ok(list.map(qs, q => value_at(d, q)))
 
 // The digest of both streams.
 //
@@ -180,7 +254,28 @@ pub fn quantiles(d: TdSketch, qs: [Float]) -> Result<[Float], skfault.SkFault>
 //                 Err(f) => println(f.message())
 // ```
 pub fn merge(a: TdSketch, b: TdSketch) -> Result<TdSketch, skfault.SkFault>
-    todo("sketch-nv.sktdigest.merge")
+    if a.compression != b.compression
+        return Err(SkShapeMismatch("compression ${a.compression}", "compression ${b.compression}"))
+    if a.count == 0
+        return Ok(b)
+    if b.count == 0
+        return Ok(a)
+    var all = list.concat(a.centroids, b.centroids)
+    list.sort_by(all, c => c.mean)
+    let count = a.count + b.count
+    let low = if a.minimum < b.minimum
+        a.minimum
+    else
+        b.minimum
+    let high = if a.maximum > b.maximum
+        a.maximum
+    else
+        b.maximum
+    Ok(TdSketch { compression: a.compression,
+        centroids: compress(all, count, a.compression),
+        count: count,
+        minimum: low,
+        maximum: high })
 
 // How many observations the digest has taken.
 //
@@ -193,7 +288,7 @@ pub fn merge(a: TdSketch, b: TdSketch) -> Result<TdSketch, skfault.SkFault>
 //         Err(f) => println(f.message())
 // ```
 pub fn count_of(d: TdSketch) -> Int
-    todo("sketch-nv.sktdigest.count_of")
+    d.count
 
 // The smallest observation, kept exactly.
 //
@@ -206,7 +301,7 @@ pub fn count_of(d: TdSketch) -> Int
 //         Err(f) => println(f.message())
 // ```
 pub fn minimum_of(d: TdSketch) -> Float
-    todo("sketch-nv.sktdigest.minimum_of")
+    d.minimum
 
 // The largest observation, kept exactly.
 //
@@ -219,7 +314,7 @@ pub fn minimum_of(d: TdSketch) -> Float
 //         Err(f) => println(f.message())
 // ```
 pub fn maximum_of(d: TdSketch) -> Float
-    todo("sketch-nv.sktdigest.maximum_of")
+    d.maximum
 
 // How many centroids the digest currently holds.
 //
@@ -235,7 +330,7 @@ pub fn maximum_of(d: TdSketch) -> Float
 //         Err(f) => println(f.message())
 // ```
 pub fn centroid_count(d: TdSketch) -> Int
-    todo("sketch-nv.sktdigest.centroid_count")
+    list.len(d.centroids)
 
 // The digest as bytes, carrying its compression.
 //
@@ -248,7 +343,21 @@ pub fn centroid_count(d: TdSketch) -> Int
 //         Err(f) => println(f.message())
 // ```
 pub fn to_bytes(d: TdSketch) -> Bytes
-    todo("sketch-nv.sktdigest.to_bytes")
+    let n = list.len(d.centroids)
+    var out = bytes.zeros(HEADER + 16 * n)
+    bytes.set_u8(out, 0, 'S')
+    bytes.set_u8(out, 1, 'K')
+    bytes.set_u8(out, 2, 'T')
+    bytes.set_u8(out, 3, FORM_VERSION)
+    bytes.set_u64_be(out, 4, float.to_bits(d.compression))
+    bytes.set_u64_be(out, 12, d.count)
+    bytes.set_u64_be(out, 20, float.to_bits(d.minimum))
+    bytes.set_u64_be(out, 28, float.to_bits(d.maximum))
+    bytes.set_u32_be(out, 36, n)
+    for i in 0..n
+        bytes.set_u64_be(out, HEADER + 16 * i, float.to_bits(d.centroids[i].mean))
+        bytes.set_u64_be(out, HEADER + 16 * i + 8, d.centroids[i].weight)
+    out
 
 // A digest read back from bytes.
 //
@@ -261,4 +370,149 @@ pub fn to_bytes(d: TdSketch) -> Bytes
 //         Err(f) => println(f.message())
 // ```
 pub fn from_bytes(b: Bytes) -> Result<TdSketch, skfault.SkFault>
-    todo("sketch-nv.sktdigest.from_bytes")
+    let size = bytes.len(b)
+    if size < HEADER
+        return Err(SkBadSerialisedForm("${size} bytes is shorter than the ${HEADER}-byte header"))
+    if byte(b, 0) != 'S' or byte(b, 1) != 'K' or byte(b, 2) != 'T'
+        return Err(SkBadSerialisedForm("the header does not begin with SKT"))
+    if byte(b, 3) != FORM_VERSION
+        return Err(SkBadSerialisedForm("form version ${byte(b, 3)} is not ${FORM_VERSION}"))
+    let compression = float.from_bits(bytes.u64_be_at(b, 4) ?? 0)
+    if not (compression >= 20.0 and compression <= 1000.0)
+        return Err(SkBadSerialisedForm("compression ${compression} is outside 20.0 ..= 1000.0"))
+    let count = bytes.u64_be_at(b, 12) ?? 0
+    let low = float.from_bits(bytes.u64_be_at(b, 20) ?? 0)
+    let high = float.from_bits(bytes.u64_be_at(b, 28) ?? 0)
+    let n = bytes.u32_be_at(b, 36) ?? 0
+    if size != HEADER + 16 * n
+        return Err(SkBadSerialisedForm("${size} bytes, where ${n} centroids need ${HEADER + 16 * n}"))
+    var centroids: [TdCentroid] = []
+    var weight = 0
+    var previous = low
+    for i in 0..n
+        let mean = float.from_bits(bytes.u64_be_at(b, HEADER + 16 * i) ?? 0)
+        let w = bytes.u64_be_at(b, HEADER + 16 * i + 8) ?? 0
+        if w < 1 or not (mean >= previous and mean <= high)
+            return Err(SkBadSerialisedForm("centroid ${i} is out of order or has no weight"))
+        list.push(centroids, TdCentroid { mean: mean, weight: w })
+        weight = weight + w
+        previous = mean
+    if weight != count
+        return Err(SkBadSerialisedForm("the centroids weigh ${weight} and the count is ${count}"))
+    Ok(TdSketch { compression: compression,
+        centroids: centroids,
+        count: count,
+        minimum: low,
+        maximum: high })
+
+// The `k1` scale function: `compression / (2 pi) * asin(2q - 1)`.
+fn k1(q: Float, compression: Float) -> Float
+    compression / (2.0 * math.pi()) * math.asin(2.0 * q - 1.0)
+
+// One merging pass over centroids sorted by mean.  A centroid absorbs
+// its right neighbour while the `k1` span of the result stays within 1.
+fn compress(sorted: [TdCentroid], total: Int, compression: Float) -> [TdCentroid]
+    var out: [TdCentroid] = []
+    let whole = total as Float
+    var mean = sorted[0].mean
+    var weight = sorted[0].weight
+    var before = 0
+    var k_left = k1(0.0, compression)
+    for i in 1..list.len(sorted)
+        let next = sorted[i]
+        let proposed = weight + next.weight
+        if k1((before + proposed) as Float / whole, compression) - k_left <= 1.0
+            mean = mean + (next.mean - mean) * next.weight as Float / proposed as Float
+            weight = proposed
+        else
+            list.push(out, TdCentroid { mean: mean, weight: weight })
+            before = before + weight
+            k_left = k1(before as Float / whole, compression)
+            mean = next.mean
+            weight = next.weight
+    list.push(out, TdCentroid { mean: mean, weight: weight })
+    out
+
+// The value at a quantile already checked to be in `0.0 ..= 1.0`.
+fn value_at(d: TdSketch, q: Float) -> Float
+    let n = list.len(d.centroids)
+    if n == 0
+        return math.nan()
+    if n == 1
+        return d.centroids[0].mean
+    let total = d.count as Float
+    let index = q * total
+    if index < 1.0
+        return d.minimum
+    let first = d.centroids[0]
+    let first_half = first.weight as Float / 2.0
+    if first.weight > 1 and index < first_half
+        return d.minimum + (index - 1.0) / (first_half - 1.0) * (first.mean - d.minimum)
+    if index > total - 1.0
+        return d.maximum
+    let last = d.centroids[n - 1]
+    let last_half = last.weight as Float / 2.0
+    if last.weight > 1 and total - index <= last_half
+        return d.maximum - (total - index - 1.0) / (last_half - 1.0) * (d.maximum - last.mean)
+    var so_far = first_half
+    var i = 0
+    for k in 0..n - 2
+        if so_far + gap_after(d, k) > index
+            break
+        so_far = so_far + gap_after(d, k)
+        i = k + 1
+    let left = d.centroids[i]
+    let right = d.centroids[i + 1]
+    let gap = gap_after(d, i)
+    var left_unit = 0.0
+    if left.weight == 1
+        if index - so_far < 0.5
+            return left.mean
+        left_unit = 0.5
+    var right_unit = 0.0
+    if right.weight == 1
+        if so_far + gap - index <= 0.5
+            return right.mean
+        right_unit = 0.5
+    let z1 = index - so_far - left_unit
+    let z2 = so_far + gap - index - right_unit
+    left.mean + (right.mean - left.mean) * z1 / (z1 + z2)
+
+// Half the weight of centroid `i` plus half the weight of the next:
+// the distance in weight between their means.
+fn gap_after(d: TdSketch, i: Int) -> Float
+    (d.centroids[i].weight + d.centroids[i + 1].weight) as Float / 2.0
+
+// The rank of a value below the first centroid's mean, interpolated
+// from the exact minimum.
+fn below_first(d: TdSketch, first: TdCentroid, value: Float, total: Float) -> Float
+    if value == d.minimum
+        return 0.5 / total
+    (1.0 + (value - d.minimum) / (first.mean - d.minimum) * (first.weight as Float / 2.0 - 1.0)) / total
+
+// The rank of a value above the last centroid's mean, interpolated
+// towards the exact maximum.
+fn above_last(d: TdSketch, last: TdCentroid, value: Float, total: Float) -> Float
+    if value == d.maximum
+        return 1.0 - 0.5 / total
+    1.0 - (1.0 + (d.maximum - value) / (d.maximum - last.mean) * (last.weight as Float / 2.0 - 1.0)) / total
+
+// The weight below a value that lies between two neighbouring means,
+// counted from the left centroid's own start.
+fn between(left: TdCentroid, right: TdCentroid, value: Float) -> Float
+    var left_out = 0.0
+    var right_out = 0.0
+    if left.weight == 1
+        if right.weight == 1
+            return 1.0
+        left_out = 0.5
+    else if right.weight == 1
+        right_out = 0.5
+    let gap = (left.weight + right.weight) as Float / 2.0
+    let inner = gap - left_out - right_out
+    let base = left.weight as Float / 2.0 + left_out
+    base + inner * (value - left.mean) / (right.mean - left.mean)
+
+// One byte of a buffer already checked to be long enough.
+fn byte(b: Bytes, i: Int) -> Int
+    bytes.byte_at(b, i) ?? 0

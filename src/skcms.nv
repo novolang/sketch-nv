@@ -1,32 +1,37 @@
 // skcms.nv — the count-min sketch, for counting how often.
 //
-// WHAT IT IS
-//
 // A count-min sketch counts occurrences of items in memory that does
-// not grow with the number of distinct items.  It is a table of `depth`
-// rows and `width` columns: each item is hashed once per row, and the
-// counter at that column is incremented.  An estimate is the SMALLEST
-// of the `depth` counters the item lands on — which is where the name
-// comes from, and why the estimate can only be too high.
-//
-// ONE-SIDED ERROR IS THE WHOLE POINT
+// not grow with the number of distinct items (Cormode and
+// Muthukrishnan, 2005).  It is a table of `depth` rows and `width`
+// columns.  Each item is placed once per row, at a column that row's
+// hash chooses, and the counter there is incremented.  An estimate is
+// the smallest of the `depth` counters the item lands on, which is
+// where the name comes from, and why the estimate can only be too high.
 //
 // The estimate is never below the true count, and it is above by more
 // than `epsilon x total` with probability at most `delta`.  A caller
-// can therefore act on a high estimate cautiously and on a low one
-// with confidence, which is exactly what a heavy-hitter detector, a
-// per-key rate limiter and a cache admission policy all need.  A
-// structure with two-sided error would give none of them anything.
+// can act on a low estimate with confidence and on a high one with
+// caution, which is what a heavy-hitter detector, a per-key rate
+// limiter and a cache admission policy need.
 //
-// THE SKETCH DOES NOT REMEMBER ITEMS
+// The sketch does not remember items.  It answers about an item the
+// caller names and cannot list what it has counted, so finding the top
+// items needs a heap of candidates kept beside it.
 //
-// It cannot list what it has counted, only answer about an item the
-// caller names.  That is what makes it small, and it is why finding
-// the top items needs a heap of candidates the caller keeps beside it.
-//
-// The hash and the hash label work exactly as in `skhll`.
+// The caller hashes each item once to 64 bits.  Row `i` takes its
+// column from that hash mixed with the row number by the SplitMix64
+// finaliser, so the rows are independent of one another even when the
+// caller's hash is weak in some of its bits.  The hash label works as
+// in `skhll`.
 
 use skfault
+
+// The serialised form: the three bytes `SKC`, a version byte, the
+// width and the depth as four bytes each, the total as eight, the
+// label's length as two and the label in UTF-8, then every counter as
+// eight bytes, row by row.  Every number is big-endian.
+const HEADER: Int = 22
+const FORM_VERSION: Int = 1
 
 // A count-min sketch.
 pub struct CmsSketch
@@ -55,7 +60,13 @@ pub struct CmsSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn new(width: Int, depth: Int, hash_id: Str) -> Result<CmsSketch, skfault.SkFault>
-    todo("sketch-nv.skcms.new")
+    if width < 1 or depth < 1
+        return Err(SkDimensionNotPositive(width, depth))
+    Ok(CmsSketch { width: width,
+        depth: depth,
+        hash_id: hash_id,
+        counts: list.zeros(width * depth),
+        total: 0 })
 
 // An empty sketch sized from the error bound the caller wants.
 //
@@ -67,6 +78,8 @@ pub fn new(width: Int, depth: Int, hash_id: Str) -> Result<CmsSketch, skfault.Sk
 //
 // This is the constructor to prefer: the numbers a caller can reason
 // about are the error and the confidence, not the width and the depth.
+// An `epsilon` or a `delta` that sizes no table, such as a `delta` of
+// `1.0` or more, is refused as `SkDimensionNotPositive`.
 //
 // ```novo
 // use skcms
@@ -77,12 +90,25 @@ pub fn new(width: Int, depth: Int, hash_id: Str) -> Result<CmsSketch, skfault.Sk
 //         Err(f) => println(f.message())
 // ```
 pub fn with_error(epsilon: Float, delta: Float, hash_id: Str) -> Result<CmsSketch, skfault.SkFault>
-    todo("sketch-nv.skcms.with_error")
+    let width = if epsilon > 0.0
+        math.ceil(2.0 / epsilon) as Int
+    else
+        0
+    let depth = if delta > 0.0
+        math.ceil(math.log(1.0 / delta) / math.log(2.0)) as Int
+    else
+        0
+    new(width, depth, hash_id)
 
 // The sketch with `count` more of an item.
 //
 // `count` may be any positive number, so a caller counting bytes or
-// costs adds them in one call rather than one at a time.
+// costs adds them in one call rather than one at a time.  A count below
+// one adds nothing, since a negative count would break the promise that
+// an estimate is never low.
+//
+// The sketch given is left unchanged.  Its counters are copied, so an
+// add costs time in proportion to `width x depth`.
 //
 // ```novo
 // use skcms
@@ -98,7 +124,7 @@ pub fn with_error(epsilon: Float, delta: Float, hash_id: Str) -> Result<CmsSketc
 //     11
 // ```
 pub fn add(s: CmsSketch, item: Bytes, count: Int, hash: fn(Bytes) -> Int) -> CmsSketch
-    todo("sketch-nv.skcms.add")
+    add_hashed(s, hash(item), count)
 
 // The sketch with `count` more of an already-hashed item.
 //
@@ -111,7 +137,17 @@ pub fn add(s: CmsSketch, item: Bytes, count: Int, hash: fn(Bytes) -> Int) -> Cms
 //         Err(f) => println(f.message())
 // ```
 pub fn add_hashed(s: CmsSketch, hashed: Int, count: Int) -> CmsSketch
-    todo("sketch-nv.skcms.add_hashed")
+    if count < 1
+        return s
+    var counts = s.counts[:]
+    for row in 0..s.depth
+        let at = row * s.width + column(hashed, row, s.width)
+        counts[at] = counts[at] + count
+    CmsSketch { width: s.width,
+        depth: s.depth,
+        hash_id: s.hash_id,
+        counts: counts,
+        total: s.total + count }
 
 // How often the sketch estimates it has seen an item.
 //
@@ -130,7 +166,7 @@ pub fn add_hashed(s: CmsSketch, hashed: Int, count: Int) -> CmsSketch
 //     11
 // ```
 pub fn estimate(s: CmsSketch, item: Bytes, hash: fn(Bytes) -> Int) -> Int
-    todo("sketch-nv.skcms.estimate")
+    estimate_hashed(s, hash(item))
 
 // How often the sketch estimates it has seen an already-hashed item.
 //
@@ -143,7 +179,12 @@ pub fn estimate(s: CmsSketch, item: Bytes, hash: fn(Bytes) -> Int) -> Int
 //         Err(f) => println(f.message())
 // ```
 pub fn estimate_hashed(s: CmsSketch, hashed: Int) -> Int
-    todo("sketch-nv.skcms.estimate_hashed")
+    var least = s.counts[column(hashed, 0, s.width)]
+    for row in 1..s.depth
+        let c = s.counts[row * s.width + column(hashed, row, s.width)]
+        if c < least
+            least = c
+    least
 
 // How far above the true count an estimate may be, as a fraction of
 // the total counted.
@@ -159,7 +200,7 @@ pub fn estimate_hashed(s: CmsSketch, hashed: Int) -> Int
 //         Err(f) => println(f.message())
 // ```
 pub fn error_bound(s: CmsSketch) -> Float
-    todo("sketch-nv.skcms.error_bound")
+    2.0 / s.width as Float
 
 // The probability that an estimate is within the error bound.
 //
@@ -174,7 +215,7 @@ pub fn error_bound(s: CmsSketch) -> Float
 //         Err(f) => println(f.message())
 // ```
 pub fn confidence(s: CmsSketch) -> Float
-    todo("sketch-nv.skcms.confidence")
+    1.0 - math.pow(0.5, s.depth as Float)
 
 // The sketch that has counted everything both have.
 //
@@ -194,7 +235,18 @@ pub fn confidence(s: CmsSketch) -> Float
 //                 Err(f) => println(f.message())
 // ```
 pub fn merge(a: CmsSketch, b: CmsSketch) -> Result<CmsSketch, skfault.SkFault>
-    todo("sketch-nv.skcms.merge")
+    if a.width != b.width or a.depth != b.depth
+        return Err(SkShapeMismatch("${a.width}x${a.depth}", "${b.width}x${b.depth}"))
+    if a.hash_id != b.hash_id
+        return Err(SkHashMismatch(a.hash_id, b.hash_id))
+    var counts = a.counts[:]
+    for i in 0..list.len(counts)
+        counts[i] = counts[i] + b.counts[i]
+    Ok(CmsSketch { width: a.width,
+        depth: a.depth,
+        hash_id: a.hash_id,
+        counts: counts,
+        total: a.total + b.total })
 
 // The sketch with every counter halved, rounding down.
 //
@@ -212,7 +264,12 @@ pub fn merge(a: CmsSketch, b: CmsSketch) -> Result<CmsSketch, skfault.SkFault>
 //         Err(f) => println(f.message())
 // ```
 pub fn halve(s: CmsSketch) -> CmsSketch
-    todo("sketch-nv.skcms.halve")
+    let counts = list.map(s.counts, c => c / 2)
+    CmsSketch { width: s.width,
+        depth: s.depth,
+        hash_id: s.hash_id,
+        counts: counts,
+        total: s.total / 2 }
 
 // The sketch as bytes, carrying its shape and hash label.
 //
@@ -225,7 +282,22 @@ pub fn halve(s: CmsSketch) -> CmsSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn to_bytes(s: CmsSketch) -> Bytes
-    todo("sketch-nv.skcms.to_bytes")
+    let label = bytes.from_str(s.hash_id)
+    let n = bytes.len(label)
+    let cells = s.width * s.depth
+    var out = bytes.zeros(HEADER + n + 8 * cells)
+    bytes.set_u8(out, 0, 'S')
+    bytes.set_u8(out, 1, 'K')
+    bytes.set_u8(out, 2, 'C')
+    bytes.set_u8(out, 3, FORM_VERSION)
+    bytes.set_u32_be(out, 4, s.width)
+    bytes.set_u32_be(out, 8, s.depth)
+    bytes.set_u64_be(out, 12, s.total)
+    bytes.set_u16_be(out, 20, n)
+    bytes.copy_into(out, HEADER, label, 0, n)
+    for i in 0..cells
+        bytes.set_u64_be(out, HEADER + n + 8 * i, s.counts[i])
+    out
 
 // A sketch read back from bytes.
 //
@@ -238,4 +310,38 @@ pub fn to_bytes(s: CmsSketch) -> Bytes
 //         Err(f) => println(f.message())
 // ```
 pub fn from_bytes(b: Bytes) -> Result<CmsSketch, skfault.SkFault>
-    todo("sketch-nv.skcms.from_bytes")
+    let size = bytes.len(b)
+    if size < HEADER
+        return Err(SkBadSerialisedForm("${size} bytes is shorter than the ${HEADER}-byte header"))
+    if byte(b, 0) != 'S' or byte(b, 1) != 'K' or byte(b, 2) != 'C'
+        return Err(SkBadSerialisedForm("the header does not begin with SKC"))
+    if byte(b, 3) != FORM_VERSION
+        return Err(SkBadSerialisedForm("form version ${byte(b, 3)} is not ${FORM_VERSION}"))
+    let width = bytes.u32_be_at(b, 4) ?? 0
+    let depth = bytes.u32_be_at(b, 8) ?? 0
+    let total = bytes.u64_be_at(b, 12) ?? 0
+    let n = bytes.u16_be_at(b, 20) ?? 0
+    if width < 1 or depth < 1
+        return Err(SkBadSerialisedForm("a table of width ${width} and depth ${depth}"))
+    let cells = width * depth
+    if size != HEADER + n + 8 * cells
+        return Err(SkBadSerialisedForm("${size} bytes, where a ${width}x${depth} table and a ${n}-byte label need ${HEADER + n + 8 * cells}"))
+    let label = bytes.to_str(bytes.slice(b, HEADER, HEADER + n))
+    var counts = list.zeros(cells)
+    for i in 0..cells
+        counts[i] = bytes.u64_be_at(b, HEADER + n + 8 * i) ?? 0
+    Ok(CmsSketch { width: width, depth: depth, hash_id: label, counts: counts, total: total })
+
+// The column row `row` places a hash in: the SplitMix64 finaliser over
+// the hash and the row number, reduced to `0 ..< width`.
+@wrapping
+fn column(hashed: Int, row: Int, width: Int) -> Int
+    var z = hashed + (row + 1) * -7046029254386353131
+    z = (z ^ (z >>> 30)) * -4658895280553007687
+    z = (z ^ (z >>> 27)) * -7723592293110705685
+    z = z ^ (z >>> 31)
+    (z >>> 1) % width
+
+// One byte of a buffer already checked to be long enough.
+fn byte(b: Bytes, i: Int) -> Int
+    bytes.byte_at(b, i) ?? 0

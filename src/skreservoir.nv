@@ -1,37 +1,39 @@
 // skreservoir.nv — reservoir sampling, for keeping a fair sample.
 //
-// WHAT IT IS
-//
 // A reservoir of capacity `k` holds a uniform random sample of `k`
 // items from a stream of unknown length, in one pass, keeping nothing
-// else.  Vitter's algorithm R: the first `k` items go in; item `n`
-// after that replaces a random one with probability `k / n`.  Every
-// item seen has exactly the same chance of being in the sample at the
-// end, whether the stream had a thousand items or a billion.
+// else.  This is Vitter's algorithm R ("Random sampling with a
+// reservoir", 1985): the first `k` items go in, and item `n` after
+// that replaces a random one with probability `k / n`.  Every item
+// offered has the same chance of being in the sample at the end,
+// whatever the length of the stream.
 //
-// It is the one structure here that keeps the items themselves, which
-// is what it is for: a sketch answers a number, and a sample answers
-// "show me some".  A log pipeline keeping a hundred requests out of
-// ten million, a test harness keeping examples of a failure, a
-// profiler keeping stacks — all of them need the thing and not a count
-// of it.
+// It is the one structure in this package that keeps the items
+// themselves.  A sketch answers a number, and a sample answers "show me
+// some": a log pipeline keeping a hundred requests out of ten million,
+// or a profiler keeping stacks.
 //
-// THE RANDOMNESS COMES FROM THE CALLER
+// The randomness comes from the caller.  `offer` takes a uniform number
+// in `0.0 ..< 1.0`, and `merge` takes a list of them, so this package
+// declares no effect and draws nothing.  A test hands in the numbers it
+// wants and gets a sample it can assert on.
 //
-// `offer` takes a uniform number in `0.0 ..< 1.0`.  This package
-// declares no effects and draws nothing: a caller that already has a
-// generator uses it, and a test hands in the numbers it wants and gets
-// a sample it can assert on.
-//
-// MERGING IS NOT FREE
-//
-// Two reservoirs merge into a uniform sample of both streams, but only
-// if the merge is weighted by how many items each stream saw — a
-// reservoir that saw a million items must dominate one that saw ten.
-// `merge` takes the uniforms it needs for that, and `seen_of` is the
-// count it weights by.
+// A merge is weighted by how many items each stream saw.  The sample of
+// the stream that saw fewer items is offered to the other one item at a
+// time, each item standing for `seen / sample size` of its stream's
+// items, with the probability of keeping it scaled by that weight.  A
+// reservoir that saw a million items therefore dominates one that saw
+// ten.  This is the weighted update of Apache DataSketches' reservoir
+// union.
 
 use skfault
+
+// The serialised form: the three bytes `SKR`, a version byte, the
+// capacity as four bytes, the seen count as eight, the number of items
+// held as four, then each item as its length in four bytes and its
+// bytes.  Every number is big-endian.
+const HEADER: Int = 20
+const FORM_VERSION: Int = 1
 
 // A reservoir sample.
 pub struct RsSketch
@@ -54,14 +56,19 @@ pub struct RsSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn new(capacity: Int) -> Result<RsSketch, skfault.SkFault>
-    todo("sketch-nv.skreservoir.new")
+    if capacity < 1
+        return Err(SkCapacityNotPositive(capacity))
+    Ok(RsSketch { capacity: capacity, seen: 0, items: [] })
 
 // The reservoir after one item has been offered to it.
 //
 // `uniform` is a random number in `0.0 ..< 1.0`, used only once the
 // reservoir is full; before that the item is taken and the number
-// ignored.  `uniforms_needed` is the call that says so, for a caller
-// that would rather not draw one it will not use.
+// ignored.  `needs_uniform` is the call that says so, for a caller
+// that would rather not draw one it will not use.  Once the reservoir
+// is full, a uniform outside `0.0 ..< 1.0` keeps nothing.
+//
+// The reservoir given is left unchanged, and the item is copied.
 //
 // ```novo
 // use skreservoir
@@ -74,7 +81,15 @@ pub fn new(capacity: Int) -> Result<RsSketch, skfault.SkFault>
 //             println("${skreservoir.seen_of(one)}")        // 1
 // ```
 pub fn offer(r: RsSketch, item: Bytes, uniform: Float) -> RsSketch
-    todo("sketch-nv.skreservoir.offer")
+    let seen = r.seen + 1
+    var items = r.items[:]
+    if list.len(items) < r.capacity
+        list.push(items, bytes.clone(item))
+    else if uniform >= 0.0 and uniform < 1.0
+        let slot = (uniform * seen as Float) as Int
+        if slot < r.capacity
+            items[slot] = bytes.clone(item)
+    RsSketch { capacity: r.capacity, seen: seen, items: items }
 
 // Whether the next `offer` will consume its uniform.
 //
@@ -90,7 +105,7 @@ pub fn offer(r: RsSketch, item: Bytes, uniform: Float) -> RsSketch
 //         Err(f) => println(f.message())
 // ```
 pub fn needs_uniform(r: RsSketch) -> Bool
-    todo("sketch-nv.skreservoir.needs_uniform")
+    list.len(r.items) >= r.capacity
 
 // The sample: every item the reservoir currently holds.
 //
@@ -106,7 +121,7 @@ pub fn needs_uniform(r: RsSketch) -> Bool
 //         Err(f) => println(f.message())
 // ```
 pub fn sample(r: RsSketch) -> [Bytes]
-    todo("sketch-nv.skreservoir.sample")
+    r.items[:]
 
 // How many items have been offered.
 //
@@ -123,7 +138,7 @@ pub fn sample(r: RsSketch) -> [Bytes]
 //         Err(f) => println(f.message())
 // ```
 pub fn seen_of(r: RsSketch) -> Int
-    todo("sketch-nv.skreservoir.seen_of")
+    r.seen
 
 // Whether the reservoir holds as many items as it can.
 //
@@ -136,7 +151,7 @@ pub fn seen_of(r: RsSketch) -> Int
 //         Err(f) => println(f.message())
 // ```
 pub fn is_full(r: RsSketch) -> Bool
-    todo("sketch-nv.skreservoir.is_full")
+    list.len(r.items) >= r.capacity
 
 // The chance that the next item offered will be kept.
 //
@@ -153,7 +168,9 @@ pub fn is_full(r: RsSketch) -> Bool
 //         Err(f) => println(f.message())
 // ```
 pub fn keep_probability(r: RsSketch) -> Float
-    todo("sketch-nv.skreservoir.keep_probability")
+    if list.len(r.items) < r.capacity
+        return 1.0
+    r.capacity as Float / (r.seen + 1) as Float
 
 // A uniform sample of both streams.
 //
@@ -162,9 +179,10 @@ pub fn keep_probability(r: RsSketch) -> Float
 // unweighted merge would give the short stream half the sample and the
 // result would not be uniform over anything.
 //
-// `uniforms` supplies the randomness; one per item of the smaller
-// sample is enough, and a shorter list is refused rather than reused,
-// because reusing a number correlates the choices.  Refused when the
+// `uniforms` supplies the randomness: one per item held by the
+// reservoir that saw fewer items.  A shorter list is refused with
+// `SkTooFewUniforms` rather than reused, because reusing a number
+// correlates the choices.  Refused with `SkShapeMismatch` when the
 // capacities differ.
 //
 // ```novo
@@ -179,7 +197,35 @@ pub fn keep_probability(r: RsSketch) -> Float
 //                 Err(f) => println(f.message())
 // ```
 pub fn merge(a: RsSketch, b: RsSketch, uniforms: [Float]) -> Result<RsSketch, skfault.SkFault>
-    todo("sketch-nv.skreservoir.merge")
+    if a.capacity != b.capacity
+        return Err(SkShapeMismatch("capacity ${a.capacity}", "capacity ${b.capacity}"))
+    let base = if a.seen >= b.seen
+        a
+    else
+        b
+    let other = if a.seen >= b.seen
+        b
+    else
+        a
+    let needed = list.len(other.items)
+    if list.len(uniforms) < needed
+        return Err(SkTooFewUniforms(needed, list.len(uniforms)))
+    var items = base.items[:]
+    if needed == 0
+        return Ok(RsSketch { capacity: base.capacity, seen: a.seen + b.seen, items: items })
+    let weight = other.seen as Float / needed as Float
+    var seen = base.seen as Float
+    for i in 0..needed
+        seen = seen + weight
+        if list.len(items) < base.capacity
+            list.push(items, bytes.clone(other.items[i]))
+        else
+            let keep = base.capacity as Float * weight / seen
+            let u = uniforms[i]
+            if u >= 0.0 and u < keep
+                let slot = (u / keep * base.capacity as Float) as Int
+                items[slot] = bytes.clone(other.items[i])
+    Ok(RsSketch { capacity: base.capacity, seen: a.seen + b.seen, items: items })
 
 // The reservoir as bytes, carrying its capacity and its seen count.
 //
@@ -192,7 +238,25 @@ pub fn merge(a: RsSketch, b: RsSketch, uniforms: [Float]) -> Result<RsSketch, sk
 //         Err(f) => println(f.message())
 // ```
 pub fn to_bytes(r: RsSketch) -> Bytes
-    todo("sketch-nv.skreservoir.to_bytes")
+    let n = list.len(r.items)
+    var size = HEADER
+    for item in r.items
+        size = size + 4 + bytes.len(item)
+    var out = bytes.zeros(size)
+    bytes.set_u8(out, 0, 'S')
+    bytes.set_u8(out, 1, 'K')
+    bytes.set_u8(out, 2, 'R')
+    bytes.set_u8(out, 3, FORM_VERSION)
+    bytes.set_u32_be(out, 4, r.capacity)
+    bytes.set_u64_be(out, 8, r.seen)
+    bytes.set_u32_be(out, 16, n)
+    var at = HEADER
+    for item in r.items
+        let len = bytes.len(item)
+        bytes.set_u32_be(out, at, len)
+        bytes.copy_into(out, at + 4, item, 0, len)
+        at = at + 4 + len
+    out
 
 // A reservoir read back from bytes.
 //
@@ -205,4 +269,32 @@ pub fn to_bytes(r: RsSketch) -> Bytes
 //         Err(f) => println(f.message())
 // ```
 pub fn from_bytes(b: Bytes) -> Result<RsSketch, skfault.SkFault>
-    todo("sketch-nv.skreservoir.from_bytes")
+    let size = bytes.len(b)
+    if size < HEADER
+        return Err(SkBadSerialisedForm("${size} bytes is shorter than the ${HEADER}-byte header"))
+    if byte(b, 0) != 'S' or byte(b, 1) != 'K' or byte(b, 2) != 'R'
+        return Err(SkBadSerialisedForm("the header does not begin with SKR"))
+    if byte(b, 3) != FORM_VERSION
+        return Err(SkBadSerialisedForm("form version ${byte(b, 3)} is not ${FORM_VERSION}"))
+    let capacity = bytes.u32_be_at(b, 4) ?? 0
+    let seen = bytes.u64_be_at(b, 8) ?? 0
+    let n = bytes.u32_be_at(b, 16) ?? 0
+    if capacity < 1 or n > capacity or seen < n
+        return Err(SkBadSerialisedForm("capacity ${capacity}, ${seen} seen and ${n} held do not agree"))
+    var items: [Bytes] = []
+    var at = HEADER
+    for i in 0..n
+        if at + 4 > size
+            return Err(SkBadSerialisedForm("item ${i} is cut off"))
+        let len = bytes.u32_be_at(b, at) ?? 0
+        if at + 4 + len > size
+            return Err(SkBadSerialisedForm("item ${i} is cut off"))
+        list.push(items, bytes.slice(b, at + 4, at + 4 + len))
+        at = at + 4 + len
+    if at != size
+        return Err(SkBadSerialisedForm("${size - at} bytes follow the last item"))
+    Ok(RsSketch { capacity: capacity, seen: seen, items: items })
+
+// One byte of a buffer already checked to be long enough.
+fn byte(b: Bytes, i: Int) -> Int
+    bytes.byte_at(b, i) ?? 0

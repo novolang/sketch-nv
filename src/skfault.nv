@@ -1,17 +1,12 @@
 // skfault.nv — the ways a sketch can be refused.
 //
-// TWO MOMENTS
-//
-// A sketch is built with parameters that fix its accuracy — a
-// precision, a width and depth, a compression — and each of those has
-// a range outside which the published error bound does not hold.  That
-// is one moment, and it happens once.
-//
-// The other is a MERGE.  Two sketches can only be merged when they
-// were built the same way and fed through the same hash, and a merge
-// that ignored either would answer a number with no error bound at
-// all — silently, and in the direction of confidence.  Every merge
-// here answers a `Result`.
+// A sketch is refused at two moments.  The first is when it is built:
+// a precision, a width and depth, a compression or a capacity each has
+// a range outside which the published error bound does not hold.  The
+// second is a merge.  Two sketches merge only when they were built the
+// same way and fed through the same hash, because a merge that ignored
+// either would answer a number with no error bound at all.  Every
+// merge answers a `Result` for that reason.
 
 // Why a sketch or a merge was refused.
 //
@@ -49,16 +44,36 @@ pub enum SkFault
     // does not know, a length that disagrees with the parameters, a
     // truncated body.
     SkBadSerialisedForm(why: Str)
+    // A reservoir merge was handed fewer uniform numbers than it
+    // needs.  A number used twice would correlate two choices, so a
+    // short list is refused rather than reused.
+    SkTooFewUniforms(needed: Int, given: Int)
 
 // `SkFault` is an `Error`, which is what lets `Result<T, SkFault>`
 // exist at all.
 impl Error for SkFault
     // The one-line message, naming what was given and what was
     // required.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("sketch-nv.SkFault.message")
+        match self
+            SkPrecisionOutOfRange(p)        =>
+                "precision ${p} is outside 4 ..= 18"
+            SkDimensionNotPositive(w, d)    =>
+                "a count-min table of width ${w} and depth ${d} needs both at least 1"
+            SkCompressionOutOfRange(c)      =>
+                "compression ${c} is outside 20.0 ..= 1000.0"
+            SkCapacityNotPositive(c)        =>
+                "reservoir capacity ${c} is not at least 1"
+            SkQuantileOutOfRange(q)         =>
+                "quantile ${q} is outside 0.0 ..= 1.0"
+            SkShapeMismatch(l, r)           =>
+                "cannot merge a sketch of shape ${l} with one of shape ${r}"
+            SkHashMismatch(l, r)            =>
+                "cannot merge a sketch fed through hash ${l} with one fed through hash ${r}"
+            SkBadSerialisedForm(why)        =>
+                "not a serialised sketch: ${why}"
+            SkTooFewUniforms(needed, given) =>
+                "the merge needs ${needed} uniform numbers and was given ${given}"
 
 // A short stable code for a log: `"precision_out_of_range"`,
 // `"hash_mismatch"`, and so on.
@@ -70,7 +85,16 @@ impl Error for SkFault
 //     println(skfault.code(SkHashMismatch("xxh3", "sha256")))
 // ```
 pub fn code(f: SkFault) -> Str
-    todo("sketch-nv.skfault.code")
+    match f
+        SkPrecisionOutOfRange(_)     => "precision_out_of_range"
+        SkDimensionNotPositive(_, _) => "dimension_not_positive"
+        SkCompressionOutOfRange(_)   => "compression_out_of_range"
+        SkCapacityNotPositive(_)     => "capacity_not_positive"
+        SkQuantileOutOfRange(_)      => "quantile_out_of_range"
+        SkShapeMismatch(_, _)        => "shape_mismatch"
+        SkHashMismatch(_, _)         => "hash_mismatch"
+        SkBadSerialisedForm(_)       => "bad_serialised_form"
+        SkTooFewUniforms(_, _)       => "too_few_uniforms"
 
 // Whether the fault is about combining two sketches rather than about
 // building one.
@@ -87,4 +111,7 @@ pub fn code(f: SkFault) -> Str
 //     println("${skfault.is_merge_fault(SkShapeMismatch("p14", "p12"))}")   // true
 // ```
 pub fn is_merge_fault(f: SkFault) -> Bool
-    todo("sketch-nv.skfault.is_merge_fault")
+    match f
+        SkShapeMismatch(_, _) => true
+        SkHashMismatch(_, _)  => true
+        _                     => false
