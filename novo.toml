@@ -1,6 +1,6 @@
 [package]
 name        = "sketch-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "HyperLogLog, count-min, t-digest and reservoir sampling as mergeable, serialisable values with their published error bounds asserted as tests.  The 64-bit hash is the caller's, passed in rather than chosen here, and the sketch carries the caller's label for it so that merging two sketches fed through different hashes is refused."
 license     = "Apache-2.0"
 
@@ -24,7 +24,7 @@ category    = "tooling"
 tags        = ["hyperloglog", "count-min", "t-digest", "reservoir-sampling", "streaming", "cardinality", "quantiles", "tooling"]
 repository  = "https://github.com/novolang/sketch-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.13.0"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
